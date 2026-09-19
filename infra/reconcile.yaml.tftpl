@@ -1,0 +1,287 @@
+# workbox reconciler — runs once per minute (Cloud Scheduler -> Workflows).
+#
+# It is a small, idempotent reconciler:
+#   1. compute the local time in the configured IANA timezone (DST-safe)
+#   2. derive the baseline desired state from the normal schedule
+#   3. read operational overrides/holds from Firestore and apply them in order
+#      (baseline < wake_override < sleep_override < hold)
+#   4. inspect the instance
+#   5. perform ONLY the transition required
+#   6. clean up state once every override/hold has expired
+#
+# Terraform fills in its interpolations below; Workflows' own expressions use the
+# doubled-dollar form so templatefile leaves them intact. Switch conditions only
+# route with next: (to named steps) to stay within the documented syntax.
+
+main:
+  steps:
+    - init:
+        assign:
+          - project: "${project}"
+          - zone: "${zone}"
+          - instance: "${instance}"
+          - wakeMin: ${wake_min}
+          - sleepMin: ${sleep_min}
+          - now: $${sys.now()}
+          - localIso: $${time.format(now, "${timezone}")}
+          - timePart: $${text.split(localIso, "T")[1]}
+          - hm: $${text.split(timePart, ":")}
+          - nowMin: $${int(hm[0]) * 60 + int(hm[1])}
+
+    # 2. Baseline desired state.
+    - baseline:
+        switch:
+          - condition: $${nowMin >= wakeMin and nowMin < sleepMin}
+            next: setAwake
+        next: setAsleep
+    - setAwake:
+        assign:
+          - desired: "awake"
+        next: readState
+    - setAsleep:
+        assign:
+          - desired: "asleep"
+        next: readState
+
+    # 3. Read overrides/holds (tolerate a missing document, abort on other errors).
+    - readState:
+        try:
+          call: googleapis.firestore.v1.projects.databases.documents.get
+          args:
+            name: $${"projects/" + project + "/databases/${database}/documents/${collection}/${document}"}
+          result: doc
+        except:
+          as: e
+          steps:
+            - checkReadError:
+                switch:
+                  - condition: $${e.code == 404}
+                    next: noDoc
+                next: raise
+            - raise:
+                raise: $${e}
+            - noDoc:
+                assign:
+                  - doc: {}
+    - fields:
+        assign:
+          - emptyFlds: {}
+          - flds: $${default(map.get(doc, ["fields"]), emptyFlds)}
+
+    # Apply in precedence order: wake_override → sleep_override → hold (each overwrites desired).
+    - evalWake:
+        call: spanState
+        args:
+          fields: $${flds}
+          key: "wake_override"
+          now: $${now}
+        result: sWake
+    - useWake:
+        switch:
+          - condition: $${sWake != ""}
+            next: assignWake
+        next: evalSleep
+    - assignWake:
+        assign:
+          - desired: $${sWake}
+        next: evalSleep
+
+    - evalSleep:
+        call: spanState
+        args:
+          fields: $${flds}
+          key: "sleep_override"
+          now: $${now}
+        result: sSleep
+    - useSleep:
+        switch:
+          - condition: $${sSleep != ""}
+            next: assignSleep
+        next: evalHold
+    - assignSleep:
+        assign:
+          - desired: $${sSleep}
+        next: evalHold
+
+    - evalHold:
+        call: spanState
+        args:
+          fields: $${flds}
+          key: "hold"
+          now: $${now}
+        result: sHold
+    - useHold:
+        switch:
+          - condition: $${sHold != ""}
+            next: assignHold
+        next: getInstance
+    - assignHold:
+        assign:
+          - desired: $${sHold}
+        next: getInstance
+
+    # 4. Inspect the instance.
+    - getInstance:
+        call: googleapis.compute.v1.instances.get
+        args:
+          project: $${project}
+          zone: $${zone}
+          instance: $${instance}
+        result: inst
+    - status:
+        assign:
+          - vmStatus: $${inst.status}
+
+    # 5. Perform only the transition required. Transitional states no-op and
+    #    settle on a later tick.
+    - reconcile:
+        switch:
+          - condition: $${desired == "awake" and vmStatus == "SUSPENDED"}
+            next: resumeVm
+          - condition: $${desired == "awake" and vmStatus == "TERMINATED"}
+            next: startVm
+          - condition: $${desired == "asleep" and vmStatus == "RUNNING"}
+            next: suspendVm
+        next: cleanup
+    - resumeVm:
+        call: googleapis.compute.v1.instances.resume
+        args:
+          project: $${project}
+          zone: $${zone}
+          instance: $${instance}
+        result: op
+        next: waitVmOp
+    - startVm:
+        call: googleapis.compute.v1.instances.start
+        args:
+          project: $${project}
+          zone: $${zone}
+          instance: $${instance}
+        result: op
+        next: waitVmOp
+    - suspendVm:
+        call: googleapis.compute.v1.instances.suspend
+        args:
+          project: $${project}
+          zone: $${zone}
+          instance: $${instance}
+        result: op
+        next: waitVmOp
+    - waitVmOp:
+        call: googleapis.compute.v1.zoneOperations.wait
+        args:
+          project: $${project}
+          zone: $${zone}
+          operation: $${op.name}
+        next: cleanup
+
+    # 6. Garbage-collect: if every present span has expired, delete the document
+    #    so state does not accumulate. Partially-expired docs are left alone
+    #    (stale spans are inert once past their end).
+    - cleanup:
+        steps:
+          - keepWake:
+              call: spanKeep
+              args:
+                fields: $${flds}
+                key: "wake_override"
+                now: $${now}
+              result: kWake
+          - keepSleep:
+              call: spanKeep
+              args:
+                fields: $${flds}
+                key: "sleep_override"
+                now: $${now}
+              result: kSleep
+          - keepHold:
+              call: spanKeep
+              args:
+                fields: $${flds}
+                key: "hold"
+                now: $${now}
+              result: kHold
+          - tally:
+              assign:
+                - present: $${kWake.present + kSleep.present + kHold.present}
+                - keep: $${kWake.keep + kSleep.keep + kHold.keep}
+          - maybeDelete:
+              switch:
+                - condition: $${present > 0 and keep == 0}
+                  next: deleteDoc
+              next: done
+          - deleteDoc:
+              try:
+                call: googleapis.firestore.v1.projects.databases.documents.delete
+                args:
+                  name: $${"projects/" + project + "/databases/${database}/documents/${collection}/${document}"}
+              except:
+                steps:
+                  - ignore:
+                      assign:
+                        - ignored: true
+              next: done
+          - done:
+              return: $${desired}
+
+# spanState and spanKeep below both decode a span from the same Firestore wire
+# shape — map.get(fields, [key, "mapValue", "fields"]) then the start/end
+# timestampValue and state stringValue. This layout is the contract with
+# internal/state/firestore.go; change both subworkflows and that file together.
+#
+# spanState returns the span's state string when [start,end) contains now, else "".
+spanState:
+  params: [fields, key, now]
+  steps:
+    - lookup:
+        assign:
+          - sp: $${map.get(fields, [key, "mapValue", "fields"])}
+    - absent:
+        switch:
+          - condition: $${sp == null}
+            next: retEmpty
+    - bounds:
+        assign:
+          - startS: $${time.parse(sp.start.timestampValue)}
+          - endS: $${time.parse(sp.end.timestampValue)}
+    - within:
+        switch:
+          - condition: $${startS <= now and now < endS}
+            next: retState
+        next: retEmpty
+    - retState:
+        return: $${sp.state.stringValue}
+    - retEmpty:
+        return: ""
+
+# spanKeep classifies a span: present (0/1) and keep (1 while now < end, else 0).
+spanKeep:
+  params: [fields, key, now]
+  steps:
+    - lookup:
+        assign:
+          - sp: $${map.get(fields, [key, "mapValue", "fields"])}
+    - absent:
+        switch:
+          - condition: $${sp == null}
+            next: retAbsent
+    - endTime:
+        assign:
+          - endS: $${time.parse(sp.end.timestampValue)}
+    - classify:
+        switch:
+          - condition: $${now < endS}
+            next: retKeep
+        next: retDrop
+    - retAbsent:
+        return:
+          present: 0
+          keep: 0
+    - retKeep:
+        return:
+          present: 1
+          keep: 1
+    - retDrop:
+        return:
+          present: 1
+          keep: 0

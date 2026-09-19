@@ -1,0 +1,26 @@
+// workbox tailnet policy fragment (HuJSON).
+//
+// If tailscale.manage_policy is FALSE (the default and the safe choice), merge
+// these sections into your EXISTING tailnet policy by hand at
+// https://login.tailscale.com/admin/acls — do NOT replace your whole policy.
+//
+// Replace you@example.com with the identity that should reach the workbox over
+// SSH, and tag:workbox if you chose a different tag.
+//
+// The tagOwners entry MUST exist before Terraform can mint the tagged
+// enrollment key. The grant permits that identity's devices to reach TCP/22 on
+// workbox nodes; ordinary OpenSSH runs over the tailnet (Tailscale SSH is not
+// required).
+{
+  "tagOwners": {
+    "tag:workbox": ["autogroup:admin", "you@example.com"],
+  },
+
+  "grants": [
+    {
+      "src": ["you@example.com"],
+      "dst": ["tag:workbox"],
+      "ip":  ["tcp:22"],
+    },
+  ],
+}
