@@ -122,6 +122,43 @@ export PATH="$HOME/.local/bin:$PATH"
 BASHRC
 fi
 
+# Forward the local ssh-agent into herdr panes so Git in a pane can authenticate
+# to private repos via the forwarded agent. Herdr runs a persistent server
+# whose panes inherit a stale environment, so the per-connection forwarded
+# socket ($SSH_AUTH_SOCK, a fresh /tmp path per SSH connection) is invisible to
+# them. Fix it the standard tmux/screen way: every SSH login relinks a stable
+# socket path to the live forwarded agent, and shells adopt that stable path
+# while it is live. Only a socket symlink lives on the VM — never any key
+# material.
+# ~/.ssh normally already exists (the guest agent creates it to install
+# `authorized_keys`); create it defensively and re-assert 0700 and dev-user
+# ownership each boot so the relink target is always present.
+install -d -m 0700 -o "$${LINUX_USER}" -g "$${LINUX_USER}" "$${USER_HOME}/.ssh"
+cat > /etc/ssh/sshrc <<'SSHRC'
+# Managed by workbox bootstrap (run by sshd via /bin/sh on each login): pin the
+# forwarded ssh-agent to a stable path. Only claim the path when it is not
+# already a live socket, so a later login does not hijack the agent an earlier
+# session's herdr panes still depend on. The first connection to find the path
+# free claims it and keeps it until its socket dies; later logins do not steal
+# it. Closing the owning connection breaks agent access for panes bound to it —
+# keep a forwarding connection attached while you need it.
+if [ -S "$SSH_AUTH_SOCK" ] && [ ! -S "$HOME/.ssh/ssh_auth_sock" ]; then
+  ln -sf "$SSH_AUTH_SOCK" "$HOME/.ssh/ssh_auth_sock"
+fi
+SSHRC
+if ! grep -q 'workbox: forwarded ssh-agent' "$${USER_HOME}/.bashrc" 2>/dev/null; then
+  cat >> "$${USER_HOME}/.bashrc" <<'BASHRC'
+
+# workbox: forwarded ssh-agent (stable socket relinked by /etc/ssh/sshrc).
+# Adoption piggybacks on ~/.bashrc, like the PATH export above — herdr's panes
+# are interactive non-login shells that source it. Adopt the socket only while
+# the link is live; a dangling link (no forwarding connection attached) leaves
+# SSH_AUTH_SOCK untouched so tools report a missing agent rather than a broken
+# one. -S follows the symlink.
+[ -S "$HOME/.ssh/ssh_auth_sock" ] && export SSH_AUTH_SOCK="$HOME/.ssh/ssh_auth_sock"
+BASHRC
+fi
+
 run_as_user() { runuser -l "$${LINUX_USER}" -c "$1"; }
 
 # Claude Code (native installer; no npm). Auth is interactive and done later by

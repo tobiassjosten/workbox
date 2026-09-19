@@ -211,7 +211,12 @@ Add an entry to `~/.ssh/config`:
 Host workbox
     HostName workbox   # Tailscale MagicDNS name
     User developer
+    ForwardAgent yes   # forward your local ssh-agent (private-repo Git on the VM)
 ```
+
+`ForwardAgent yes` lets Git on the VM authenticate to private repositories using
+your local ssh-agent — no key is ever stored on the VM. Omit it if you do not
+want agent forwarding.
 
 Connect and finish setup:
 

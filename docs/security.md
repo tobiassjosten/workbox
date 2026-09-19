@@ -57,6 +57,25 @@ public port. Inbound access is exclusively over Tailscale.
   ssh-agent, `known_hosts`, `ProxyJump` and `ControlMaster` all work as usual.
   There is no Go SSH implementation and no key material in this repository.
 
+### Forwarded ssh-agent (Git access from the VM)
+
+To use private Git repositories from the VM without storing a key on it, the
+bootstrap wires up **ssh-agent forwarding** — never a stored key:
+
+- The user's client opts in (`ForwardAgent yes` for the workbox host in
+  `~/.ssh/config`); forwarding is never forced by the CLI.
+- A bootstrap-managed `/etc/ssh/sshrc` links the forwarded socket to a stable
+  path (`~/.ssh/ssh_auth_sock`) whenever that path is not already a live socket.
+  The first connection to find it free claims it, so herdr's persistent panes —
+  which inherit a stale environment — reach the agent; a later login does not
+  steal it from an earlier session. Shells adopt that path only while it points
+  at a live socket.
+- **Only a socket symlink lives on the VM — still no key material.** While a
+  forwarding connection is open, the agent is reachable by anything running as
+  the dev user, which is consistent with the threat model (that identity is
+  already assumed to run untrusted workloads and carries no cloud authority).
+  The agent becomes unreachable once the connection closes.
+
 ## Tailscale
 
 - The VM joins the tailnet tagged `tag:workbox`.
