@@ -1,0 +1,81 @@
+# workbox configuration — copy to ~/.config/workbox/config.yaml and edit.
+#
+#   make configure          # creates the file from this example (never overwrites)
+#   workbox --config PATH    # or set WORKBOX_CONFIG=PATH to override the location
+#
+# Both the Go CLI and Terraform read this same file, so there is one source of
+# truth for project, zone, hostname and schedule. No secrets belong here.
+
+# Logical name of the workbox. Used as the Compute Engine instance name and the
+# Firestore state document id.
+name: workbox
+
+gcp:
+  # An existing, billing-enabled GCP project. Terraform does not create it.
+  project_id: example-project
+  # Region and zone. europe-north2 (Stockholm) keeps latency low from Sweden.
+  region: europe-north2
+  zone: europe-north2-a
+  # Optional: Cloud Scheduler and Cloud Workflows are not available in all
+  # regions (e.g. europe-north2 lacks them). Set services_region to a nearby
+  # supported region. Defaults to gcp.region if omitted.
+  # services_region: europe-west3
+  # Custom E2 shape: 8 vCPU / 16 GB. E2 supports suspend/resume (no GPU).
+  machine_type: e2-custom-8-16384
+
+  # Disk sizes in GB. The boot disk holds the OS; the data disk holds /work and
+  # is protected from destruction (see infra/storage.tf).
+  boot_disk_gb: 30
+  data_disk_gb: 200
+
+  # Optional. Defaults shown.
+  image_family: ubuntu-2404-lts-amd64
+  image_project: ubuntu-os-cloud
+  # Deletion protection guards the VM against accidental `terraform destroy`.
+  # Set to false only when you intend to replace or remove the instance.
+  deletion_protection: true
+
+machine:
+  # Linux login user created on the VM. Do not use "root".
+  linux_user: developer
+  # Path to YOUR SSH public key. Only the public key is ever uploaded; no
+  # private key is copied to the VM. ~ is expanded.
+  ssh_public_key_file: ~/.ssh/id_ed25519.pub
+  # Where the persistent development disk is mounted. Optional; defaults to /work.
+  data_mount: /work
+
+tailscale:
+  # Tailscale MagicDNS hostname the node registers as.
+  hostname: workbox
+  # Tag applied to the node. Must be defined in tagOwners in your tailnet policy
+  # (see infra/tailscale-policy.example.hujson).
+  tag: tag:workbox
+  # SSH destination used by `workbox ssh` / `workbox herdr`. Optional; defaults
+  # to the hostname. Point it at a Host alias in ~/.ssh/config or the MagicDNS
+  # name.
+  ssh_target: workbox
+  # Your tailnet identity (email or group:...) that should get SSH access to the
+  # node. Used only to render the example policy fragment.
+  user: you@example.com
+  # DANGER: when true, Terraform OWNS AND OVERWRITES your ENTIRE tailnet policy
+  # file. Leave false unless this tailnet is dedicated to workbox. See
+  # docs/security.md. When false, you apply the policy fragment by hand.
+  manage_policy: false
+
+schedule:
+  # IANA timezone. DST is handled automatically; do not use fixed UTC offsets.
+  timezone: Europe/Stockholm
+  # Baseline wake and sleep, local time, HH:MM. wake must be earlier than sleep.
+  wake: "06:00"
+  sleep: "23:00"
+
+state:
+  # Firestore database and document location for the tiny operational state.
+  # Defaults shown; the collection/document rarely need changing.
+  firestore_database: "(default)"
+  # Firestore region/multi-region, set when Terraform creates the database.
+  # Many compute regions are not Firestore locations, so this defaults to the
+  # eur3 European multi-region. Use e.g. "europe-west1" for a single region.
+  firestore_location: eur3
+  collection: workbox
+  # document defaults to `name` when empty.
