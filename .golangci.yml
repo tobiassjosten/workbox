@@ -1,0 +1,16 @@
+# golangci-lint configuration. The default linters (errcheck, govet, ineffassign,
+# staticcheck, unused) run; this file only tunes errcheck so it flags genuinely
+# unchecked errors without the conventional low-value noise.
+version: "2"
+
+linters:
+  settings:
+    errcheck:
+      # Writes to stdout/stderr and test env teardown are best-effort by
+      # convention; a failed status write or Unsetenv is neither actionable nor
+      # worth threading an error through.
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - os.Unsetenv

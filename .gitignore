@@ -1,0 +1,55 @@
+# --- Local workbox configuration (may contain project-specific values) ---
+/workbox.yaml
+/config.yaml
+/*.local.yaml
+CLAUDE.local.md
+
+# --- Terraform state, plans and provider cache (NEVER commit) ---
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfplan.*
+crash.log
+crash.*.log
+.terraform/
+.terraformrc
+terraform.rc
+# Keep the dependency lock file committed:
+!.terraform.lock.hcl
+# Any *.tfvars may hold environment-specific values; keep them out of Git.
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+# Backend config holds the environment-specific state bucket; keep the example.
+/infra/backend.hcl
+
+# --- Secrets and credentials (NEVER commit) ---
+.env
+.env.*
+*.pem
+*.key
+*_key
+*_key.json
+credentials.json
+service-account*.json
+application_default_credentials.json
+
+# --- Built binaries ---
+/workbox
+/bin/
+/dist/
+*.exe
+
+# --- Go ---
+*.test
+*.out
+coverage.*
+
+# --- OS / editor junk ---
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+.idea/
+.vscode/
