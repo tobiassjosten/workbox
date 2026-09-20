@@ -65,11 +65,15 @@ bootstrap wires up **ssh-agent forwarding** — never a stored key:
 - The user's client opts in (`ForwardAgent yes` for the workbox host in
   `~/.ssh/config`); forwarding is never forced by the CLI.
 - A bootstrap-managed `/etc/ssh/sshrc` links the forwarded socket to a stable
-  path (`~/.ssh/ssh_auth_sock`) whenever that path is not already a live socket.
-  The first connection to find it free claims it, so herdr's persistent panes —
-  which inherit a stale environment — reach the agent; a later login does not
-  steal it from an earlier session. Shells adopt that path only while it points
-  at a live socket.
+  path (`~/.ssh/ssh_auth_sock`) on every login (last-writer-wins), so herdr's
+  persistent panes — which inherit a stale environment — reach the agent through
+  that path. Repointing on every login is deliberate: after a suspend/resume the
+  previous connection's socket can survive as a socket file while being dead from
+  the client side, and a "claim only when free" scheme would pin the stable path
+  to that defunct agent so every wake would fail with publickey. The trade-off is
+  that concurrent logins steal the link from each other — a second login repoints
+  the path, so the last to log in owns the agent; keep a single active forwarding
+  connection. Shells adopt the path only while it points at a live socket.
 - **Only a socket symlink lives on the VM — still no key material.** While a
   forwarding connection is open, the agent is reachable by anything running as
   the dev user, which is consistent with the threat model (that identity is
