@@ -136,18 +136,12 @@ fi
 install -d -m 0700 -o "$${LINUX_USER}" -g "$${LINUX_USER}" "$${USER_HOME}/.ssh"
 cat > /etc/ssh/sshrc <<'SSHRC'
 # Managed by workbox bootstrap (run by sshd via /bin/sh on each login): pin the
-# forwarded ssh-agent to a stable path. Last-writer-wins — every login repoints
-# the stable path to its own live forwarded socket. This is deliberate: after a
-# suspend/resume the previous connection's socket can survive as a socket file
-# (its sshd process is restored from RAM) while being dead from the client side,
-# so a "claim only when free" guard would pin the stable path to a defunct agent
-# and every wake would fail with publickey. Unconditionally relinking lets the
-# newest connection take over; panes reach the agent through the stable path, so
-# they follow the relink without reopening. The trade-off is that concurrent
-# logins steal the link from each other — with more than one forwarding
-# connection open the last to log in owns the agent — so keep a single active
-# connection. The owning connection must stay attached for agent access; closing
-# it leaves a dangling link, which .bashrc's -S test then declines to adopt.
+# forwarded ssh-agent to a stable path so herdr's persistent panes reach it.
+# Last-writer-wins — relink unconditionally so a suspend/resume can't pin the
+# path to a defunct-but-still-present socket and fail every wake with publickey.
+# Keep a single forwarding connection attached: the last login owns the agent,
+# and closing it leaves a dangling link that .bashrc's -S test declines to adopt.
+# Full rationale in docs/security.md ("Forwarded ssh-agent").
 if [ -S "$SSH_AUTH_SOCK" ]; then
   ln -sf "$SSH_AUTH_SOCK" "$HOME/.ssh/ssh_auth_sock"
 fi
