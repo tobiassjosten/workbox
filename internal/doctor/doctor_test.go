@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/tobiassjosten/workbox/internal/compute"
 	"github.com/tobiassjosten/workbox/internal/config"
@@ -88,3 +89,24 @@ func (erroringCompute) Status(context.Context) (compute.State, error) {
 func (erroringCompute) Start(context.Context) error   { return nil }
 func (erroringCompute) Resume(context.Context) error  { return nil }
 func (erroringCompute) Suspend(context.Context) error { return nil }
+
+func TestConnectTimeout(t *testing.T) {
+	thirty := 30
+	cfg := &config.Config{}
+	cfg.SSH.ConnectTimeoutSeconds = &thirty
+	for _, tc := range []struct {
+		name string
+		deps Deps
+		want time.Duration
+	}{
+		{"configured", Deps{Config: cfg}, 30 * time.Second},
+		{"unset", Deps{Config: &config.Config{}}, 15 * time.Second},
+		{"no config", Deps{}, 15 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.deps.connectTimeout(); got != tc.want {
+				t.Errorf("connectTimeout() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

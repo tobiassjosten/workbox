@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 const minimal = `
@@ -168,5 +169,46 @@ func TestValidateNegativeSwapRejected(t *testing.T) {
 	cfg := strings.Replace(minimal, "  linux_user: developer\n", "  linux_user: developer\n  swap_gb: -1\n", 1)
 	if _, err := Parse([]byte(cfg)); err == nil {
 		t.Fatal("expected error for negative machine.swap_gb")
+	}
+}
+
+func TestSSHDefaults(t *testing.T) {
+	c, err := Parse([]byte(minimal))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := c.SSH.ConnectTimeout(); got != 15*time.Second {
+		t.Errorf("ConnectTimeout default = %v, want 15s", got)
+	}
+	if got := c.SSH.WaitTimeout(); got != 180*time.Second {
+		t.Errorf("WaitTimeout default = %v, want 180s", got)
+	}
+}
+
+func TestSSHConfigured(t *testing.T) {
+	cfg := minimal + `ssh:
+  connect_timeout_seconds: 30
+  wait_timeout_seconds: 600
+`
+	c, err := Parse([]byte(cfg))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := c.SSH.ConnectTimeout(); got != 30*time.Second {
+		t.Errorf("ConnectTimeout = %v, want 30s", got)
+	}
+	if got := c.SSH.WaitTimeout(); got != 600*time.Second {
+		t.Errorf("WaitTimeout = %v, want 600s", got)
+	}
+}
+
+func TestValidateBadSSHRejected(t *testing.T) {
+	for _, bad := range []string{
+		"ssh:\n  connect_timeout_seconds: 0\n",
+		"ssh:\n  wait_timeout_seconds: -1\n",
+	} {
+		if _, err := Parse([]byte(minimal + bad)); err == nil {
+			t.Errorf("expected error for %q", bad)
+		}
 	}
 }

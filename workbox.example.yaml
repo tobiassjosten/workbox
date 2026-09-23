@@ -75,6 +75,13 @@ schedule:
   wake: "06:00"
   sleep: "23:00"
 
+ssh:
+  # Per-probe SSH connect timeout in seconds. Default 15.
+  connect_timeout_seconds: 15
+  # Overall budget (seconds) to wait for SSH after a wake before giving up with a
+  # diagnostic. Default 180.
+  wait_timeout_seconds: 180
+
 state:
   # Firestore database and document location for the tiny operational state.
   # Defaults shown; the collection/document rarely need changing.

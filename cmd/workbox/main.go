@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -261,23 +262,66 @@ func sshTarget(cfg *config.Config) ssh.Target {
 	return ssh.Target{Host: cfg.Tailscale.SSHTarget, User: cfg.Machine.LinuxUser}
 }
 
-// wakeAndWait wakes the VM (with a stay-awake hold if needed) and waits for SSH.
+// wakeAndWait wakes the VM and waits for SSH.
 func wakeAndWait(ctx context.Context, cfg *config.Config) error {
-	const (
-		waitTimeout  = 3 * time.Minute
-		waitInterval = 3 * time.Second
-	)
+	const waitInterval = 3 * time.Second
+	connectTimeout := cfg.SSH.ConnectTimeout()
+	waitTimeout := cfg.SSH.WaitTimeout()
+
 	app, cleanup, err := buildApp(ctx, cfg)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
+	// This flow hands off to ssh/herdr, whose stdout is the remote command's
+	// output; keep workbox's own progress lines on stderr.
+	app.Out = os.Stderr
 
 	if err := app.Wake(ctx); err != nil {
 		return err
 	}
+	target := sshTarget(cfg)
 	fmt.Fprintln(os.Stderr, "Waiting for SSH...")
-	return ssh.WaitReachable(ctx, sshTarget(cfg), waitTimeout, waitInterval)
+	if err := ssh.WaitReachable(ctx, target, connectTimeout, waitTimeout, waitInterval); err != nil {
+		return diagnoseUnreachable(ctx, os.Stderr, app.Compute, target, waitTimeout, err)
+	}
+	return nil
+}
+
+// diagnoseUnreachable turns a bare wait-timeout into an actionable message
+// unless the VM is known to be asleep. The wait error (printed by the caller)
+// carries ssh's last error, which names the cause; the hint lists the usual ones
+// and how to dig further. A cancelled wait (Ctrl-C) passes through with no hint,
+// as does a VM the Compute API reports in any state but RUNNING — an unreadable
+// state still gets the hint, since that is when the user needs it most.
+func diagnoseUnreachable(ctx context.Context, w io.Writer, comp compute.Compute, target ssh.Target, waitTimeout time.Duration, waitErr error) error {
+	if !errors.Is(waitErr, context.DeadlineExceeded) {
+		return waitErr
+	}
+	st, statusErr := comp.Status(ctx)
+	if statusErr != nil || st == compute.Running {
+		// The error text is an argument, never part of the format: a % in it
+		// would otherwise be read as a verb and garble the whole hint.
+		first := "The VM reports RUNNING but SSH did not become reachable within %s.\n"
+		args := []any{waitTimeout}
+		if statusErr != nil {
+			first = "SSH did not become reachable within %s, and the VM's state could not be read (%v).\n"
+			args = append(args, statusErr)
+		}
+		args = append(args, target.Destination())
+		fmt.Fprintf(w,
+			"\n"+first+
+				"If an ssh error is shown below, it usually names the cause. Common ones:\n"+
+				"  - local Tailscale down, or the host name not resolving\n"+
+				"  - a changed host key (e.g. after a VM rebuild): check ~/.ssh/known_hosts\n"+
+				"  - no usable key in your ssh-agent (Permission denied)\n"+
+				"  - an overloaded VM whose SSH handshake is too slow for the probe\n"+
+				"Connect directly for details (and, if overloaded, to shed load):\n"+
+				"    ssh -v -o ConnectTimeout=60 -o ServerAliveInterval=15 %s\n"+
+				"For a slow VM, raise ssh.connect_timeout_seconds / ssh.wait_timeout_seconds in your config.\n\n",
+			args...)
+	}
+	return waitErr
 }
 
 // runUp is the default flow: wake, wait, open Herdr.

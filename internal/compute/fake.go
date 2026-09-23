@@ -19,9 +19,12 @@ type Fake struct {
 	StatusSeq []State
 
 	Calls []string
-	// Err, when non-nil, is returned by Start/Resume/Suspend. Status always
-	// succeeds so tests can drive a failing transition from a known state.
+	// Err, when non-nil, is returned by Start/Resume/Suspend. Status succeeds
+	// unless StatusErr is set, so tests can drive a failing transition from a
+	// known state.
 	Err error
+	// StatusErr, when non-nil, is returned by Status.
+	StatusErr error
 }
 
 // NewFake returns a Fake starting in the given state.
@@ -31,6 +34,9 @@ func (f *Fake) Status(_ context.Context) (State, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.Calls = append(f.Calls, "status")
+	if f.StatusErr != nil {
+		return Unknown, f.StatusErr
+	}
 	if len(f.StatusSeq) > 0 {
 		s := f.StatusSeq[0]
 		f.StatusSeq = f.StatusSeq[1:]

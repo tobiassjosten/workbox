@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/tobiassjosten/workbox/internal/schedule"
 	"gopkg.in/yaml.v3"
@@ -31,6 +32,7 @@ type Config struct {
 	Tailscale Tailscale `yaml:"tailscale"`
 	Schedule  Schedule  `yaml:"schedule"`
 	State     State     `yaml:"state"`
+	SSH       SSH       `yaml:"ssh"`
 }
 
 // GCP holds Google Cloud placement and sizing.
@@ -98,6 +100,43 @@ type State struct {
 	Collection        string `yaml:"collection"`
 	// Document defaults to Name when empty.
 	Document string `yaml:"document"`
+}
+
+// SSH tunes how the CLI probes for and waits on SSH reachability after a wake.
+// The defaults suit a healthy VM; raise them if a loaded machine is slow to
+// complete the SSH handshake (which otherwise shows up as "Waiting for SSH..."
+// timing out after WaitTimeoutSeconds).
+type SSH struct {
+	// ConnectTimeoutSeconds bounds each reachability probe's SSH handshake.
+	// Pointer so an absent key defaults while an explicit value (incl. small
+	// ones) is honored. Default defaultSSHConnectTimeoutSeconds.
+	ConnectTimeoutSeconds *int `yaml:"connect_timeout_seconds"`
+	// WaitTimeoutSeconds is the overall budget for waiting for SSH after a wake
+	// before giving up with a diagnostic. Default defaultSSHWaitTimeoutSeconds.
+	WaitTimeoutSeconds *int `yaml:"wait_timeout_seconds"`
+}
+
+const (
+	defaultSSHConnectTimeoutSeconds = 15
+	defaultSSHWaitTimeoutSeconds    = 180
+)
+
+// ConnectTimeout returns the per-probe SSH connect timeout.
+func (s SSH) ConnectTimeout() time.Duration {
+	n := defaultSSHConnectTimeoutSeconds
+	if s.ConnectTimeoutSeconds != nil {
+		n = *s.ConnectTimeoutSeconds
+	}
+	return time.Duration(n) * time.Second
+}
+
+// WaitTimeout returns the overall wait-for-SSH budget after a wake.
+func (s SSH) WaitTimeout() time.Duration {
+	n := defaultSSHWaitTimeoutSeconds
+	if s.WaitTimeoutSeconds != nil {
+		n = *s.WaitTimeoutSeconds
+	}
+	return time.Duration(n) * time.Second
 }
 
 // ResolvePath returns the config path to load, honoring the precedence rules.
@@ -209,6 +248,12 @@ func (c *Config) Validate() error {
 	}
 	if c.GCP.DataDiskGB <= 0 {
 		return fmt.Errorf("gcp.data_disk_gb must be positive")
+	}
+	if c.SSH.ConnectTimeoutSeconds != nil && *c.SSH.ConnectTimeoutSeconds <= 0 {
+		return fmt.Errorf("ssh.connect_timeout_seconds must be positive")
+	}
+	if c.SSH.WaitTimeoutSeconds != nil && *c.SSH.WaitTimeoutSeconds <= 0 {
+		return fmt.Errorf("ssh.wait_timeout_seconds must be positive")
 	}
 	if c.Machine.SwapGB != nil && *c.Machine.SwapGB < 0 {
 		return fmt.Errorf("machine.swap_gb must not be negative")

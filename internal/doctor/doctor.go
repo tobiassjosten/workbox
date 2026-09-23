@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"time"
 
 	"github.com/tobiassjosten/workbox/internal/compute"
 	"github.com/tobiassjosten/workbox/internal/config"
@@ -52,7 +53,8 @@ type Deps struct {
 	// runRemote runs a command on the workbox over ssh and returns success
 	// (defaults to a BatchMode ssh exec).
 	runRemote func(ctx context.Context, t ssh.Target, cmd string) error
-	// reachable reports SSH reachability (defaults to ssh.Reachable).
+	// reachable reports SSH reachability (defaults to ssh.ReachableWithin with
+	// the configured connect timeout).
 	reachable func(ctx context.Context, t ssh.Target) bool
 }
 
@@ -60,19 +62,28 @@ func (d *Deps) defaults() {
 	if d.lookPath == nil {
 		d.lookPath = exec.LookPath
 	}
+	timeout := d.connectTimeout()
 	if d.reachable == nil {
-		d.reachable = ssh.Reachable
+		d.reachable = func(ctx context.Context, t ssh.Target) bool {
+			return ssh.ReachableWithin(ctx, t, timeout)
+		}
 	}
 	if d.runRemote == nil {
 		d.runRemote = func(ctx context.Context, t ssh.Target, cmd string) error {
-			args := []string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=accept-new"}
-			if t.User != "" {
-				args = append(args, "-l", t.User)
-			}
-			args = append(args, t.Host, cmd)
-			return exec.CommandContext(ctx, "ssh", args...).Run()
+			return exec.CommandContext(ctx, "ssh", ssh.RemoteArgs(t, timeout, cmd)...).Run()
 		}
 	}
+}
+
+// connectTimeout is the SSH connect timeout every doctor probe uses, so a
+// loaded VM that passes reachability doesn't then fail the remote checks. A nil
+// Config (the "config not loaded" path) yields the default.
+func (d *Deps) connectTimeout() time.Duration {
+	var cfgSSH config.SSH // zero value yields the default timeout
+	if d.Config != nil {
+		cfgSSH = d.Config.SSH
+	}
+	return cfgSSH.ConnectTimeout()
 }
 
 // Run executes all diagnostics in order and returns their results.
