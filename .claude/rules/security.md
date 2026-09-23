@@ -24,7 +24,8 @@ private tailnet. Design to that model.
 - **Secrets never enter Git.** No Terraform state, `*.tfvars`, `.env`, credentials,
   auth tokens, or Claude credentials. `.gitignore` enforces this; keep it strict.
 - **Tailscale enrollment key:** single-use, short-lived (1h), pre-authorized,
-  tagged, `ephemeral=false`. It appears briefly in instance metadata and in
+  tagged, `ephemeral=false`. It stays in its own instance metadata entry
+  (`ignore_changes`, so a replaced key never reaches a running VM) and in
   (git-ignored) Terraform state; it is useless once consumed. Never leave a
   reusable long-lived auth token on the VM. Never print it or put it in an output.
 - **Tailnet policy is a global resource.** Never overwrite a user's whole policy.

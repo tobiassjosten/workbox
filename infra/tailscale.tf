@@ -30,9 +30,14 @@ resource "tailscale_acl" "policy" {
 }
 
 # Single-use, short-lived, pre-authorized, tagged enrollment key. It is consumed
-# on the VM's first boot and then useless. It is stored sensitively in Terraform
-# state and briefly appears in instance metadata; keep state out of Git. The node
-# is NOT ephemeral, so it keeps its identity across suspend/resume.
+# by the first successful join; a failed join leaves it unconsumed, bounded by
+# the 1 h expiry. It is stored sensitively in Terraform state and stays in its
+# own instance metadata entry (workbox-ts-authkey) for the life of the instance;
+# Terraform ignores later changes to that entry, so a replacement key never
+# reaches an already-enrolled VM. Because ignore_changes also suppresses creating
+# the entry, instances that predate it have none until they are replaced (see
+# docs/operations.md). Keep state out of Git. The node is NOT ephemeral, so it
+# keeps its identity across suspend/resume.
 resource "tailscale_tailnet_key" "bootstrap" {
   reusable            = false
   ephemeral           = false

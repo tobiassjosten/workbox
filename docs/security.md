@@ -102,9 +102,14 @@ key is created by Terraform as:
 
 Consequences and the accepted trade-off:
 
-- The key value is **sensitive** and appears briefly in the VM's startup-script
-  metadata and in Terraform state. It is consumed on first boot and is then
-  useless.
+- The key value is **sensitive**. It sits in Terraform state and in its own
+  instance metadata entry (`workbox-ts-authkey`, not the startup-script) for the
+  life of the instance; it is consumed by the first successful join and is then
+  useless. A failed join is non-fatal, so the key can remain unconsumed — the
+  one-hour `expiry` is what bounds it then. The
+  startup script reads it only when the VM is not yet enrolled. Terraform ignores
+  later changes to that entry, so a replaced key (any change to its arguments,
+  or a `-replace`) never lands, live and unused, in a running VM's metadata.
 - It is **never** emitted as a Terraform output and never appears in docs.
 - There is **no reusable, long-lived auth token** left on the VM.
 - Terraform state therefore transiently contains a credential — which is exactly

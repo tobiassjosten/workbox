@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 )
 
@@ -137,5 +138,27 @@ func TestLoadMissingFile(t *testing.T) {
 	_, err := Load(filepath.Join(t.TempDir(), "nope.yaml"))
 	if err == nil {
 		t.Error("expected error for missing config file")
+	}
+}
+
+func readInfra(t *testing.T, name string) string {
+	t.Helper()
+	raw, err := os.ReadFile("../../infra/" + name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+// The enrollment key's metadata entry must be the one ignore_changes names, or a
+// replaced key would reach a running VM (see infra/compute.tf).
+func TestTailscaleKeyEntryIsIgnored(t *testing.T) {
+	m := regexp.MustCompile(`ts_authkey_attr\s*=\s*"([^"]+)"`).FindStringSubmatch(readInfra(t, "locals.tf"))
+	if m == nil {
+		t.Fatal("infra/locals.tf no longer defines ts_authkey_attr")
+	}
+	want := regexp.MustCompile(`ignore_changes\s*=\s*\[metadata\["` + regexp.QuoteMeta(m[1]) + `"\]\]`)
+	if !want.MatchString(readInfra(t, "compute.tf")) {
+		t.Errorf("infra/compute.tf does not ignore_changes metadata[%q]", m[1])
 	}
 }

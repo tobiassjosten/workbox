@@ -91,9 +91,26 @@ if ! command -v tailscale >/dev/null 2>&1; then
   apt-get install -y tailscale
 fi
 systemctl enable --now tailscaled || true
+# The single-use enrollment key is read from its own metadata entry only when
+# not yet enrolled, and never logged. Neither a missing key nor a rejected one
+# (single-use, 1 h expiry, so a re-run often has a stale one) may abort the
+# script: the steps below still run, leaving a usable machine instead of a
+# half-built one. Recovery from outside the tailnet: put a fresh key in the
+# instance's ${ts_authkey_attr} metadata entry — Terraform's ignore_changes
+# leaves hand edits alone — and reboot, which re-runs this block.
 if ! tailscale status >/dev/null 2>&1; then
   LOG "joining tailnet"
-  tailscale up --authkey="${ts_authkey}" --hostname="${ts_hostname}" --ssh=false
+  TS_AUTHKEY="$(curl -sS -f --max-time 5 --retry 3 --retry-connrefused --retry-delay 2 \
+    -H "Metadata-Flavor: Google" \
+    "http://metadata.google.internal/computeMetadata/v1/instance/attributes/${ts_authkey_attr}" \
+    || true)"
+  if [ -n "$${TS_AUTHKEY}" ]; then
+    tailscale up --authkey="$${TS_AUTHKEY}" --hostname="${ts_hostname}" --ssh=false \
+      || LOG "tailnet join failed (non-fatal); set a fresh key in the ${ts_authkey_attr} metadata entry and reboot"
+  else
+    LOG "no enrollment key in metadata; set one in the ${ts_authkey_attr} entry and reboot"
+  fi
+  unset TS_AUTHKEY
 fi
 
 # --- Development user tooling (run as the user, not root) --------------------

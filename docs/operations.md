@@ -103,6 +103,28 @@ in the Tailscale admin console; you granted yourself the `workboxOperator` IAM
 role; and `~/.ssh/config` has a `Host workbox` entry (or use the full MagicDNS
 name).
 
+The enrollment key's metadata entry (`workbox-ts-authkey`) is created with the
+instance, and `ignore_changes` also stops Terraform adding it to one that
+already exists — so a VM that predates it has no such entry until it is
+replaced. That only matters if the VM loses its tailnet identity, in which case
+the recovery below applies.
+
+If the VM never appears in the admin console, it failed to join during
+provisioning (the join is non-fatal, so the rest of the bootstrap still ran).
+Read the instance's serial-console output for `[workbox-bootstrap] tailnet join
+failed` or `no enrollment key in metadata`; if either is there, put a fresh
+single-use tagged key in the instance's `workbox-ts-authkey` metadata entry and
+reboot the VM — the startup script retries the join on the next boot:
+
+```bash
+gcloud compute instances add-metadata workbox --zone=ZONE \
+  --metadata workbox-ts-authkey=tskey-auth-...
+gcloud compute instances stop workbox --zone=ZONE   # clean stop, not a reset
+workbox wake                                        # start; re-runs the script
+```
+
+Terraform's `ignore_changes` leaves the hand-set value alone afterwards.
+
 ## Replacing the VM while keeping `/work`
 
 The data disk has `prevent_destroy` and `auto_delete = false`, so it is never
@@ -111,13 +133,24 @@ automatically on the new VM.
 
 **Option A — Terraform-driven (recommended):**
 
+First set `gcp.deletion_protection: false` in your config and `make tf-apply`:
+Compute Engine refuses to delete a protected instance, so the replace would
+fail. Then remove the old machine in the Tailscale admin console, so the new VM
+registers under the same hostname (and `ssh_target` keeps resolving); a name
+still taken at enrollment gets a numeric suffix. Then:
+
 ```bash
 terraform -chdir=infra apply -replace=google_compute_instance.workbox \
+  -replace=tailscale_tailnet_key.bootstrap \
   -var config_file=$HOME/.config/workbox/config.yaml
 ```
 
+Afterwards set `gcp.deletion_protection` back to `true` and `make tf-apply`.
+
 Terraform destroys and recreates the instance; the data disk is untouched and
-re-attached with the same stable device name.
+re-attached with the same stable device name. The enrollment key is replaced
+with it because the old one is single-use and already consumed: a new VM given
+it would fail `tailscale up` and never join the tailnet.
 
 **Option B — manual detach/reattach:**
 

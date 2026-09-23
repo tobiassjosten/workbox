@@ -59,13 +59,18 @@ resource "google_compute_instance" "workbox" {
     block-project-ssh-keys = "true"
     enable-oslogin         = "false"
 
+    # The single-use Tailscale enrollment key, in its own entry so the startup
+    # script can stay Terraform-managed while this one is ignored after create
+    # (see lifecycle below). The script reads it only when not yet enrolled.
+    (local.ts_authkey_attr) = tailscale_tailnet_key.bootstrap.key
+
     startup-script = templatefile("${path.module}/cloud-init.sh.tftpl", {
       linux_user       = local.linux_user
       data_device_name = local.data_device_name
       data_mount       = local.data_mount
       timezone         = local.timezone
       ts_hostname      = local.ts_hostname
-      ts_authkey       = tailscale_tailnet_key.bootstrap.key
+      ts_authkey_attr  = local.ts_authkey_attr
     })
   }
 
@@ -75,9 +80,28 @@ resource "google_compute_instance" "workbox" {
     tailscale_tailnet_key.bootstrap,
   ]
 
+  # NOTE: the startup-script is intentionally Terraform-managed (not ignored) so
+  # provisioning changes reach the VM on the next `terraform apply`. It carries
+  # no secret: the enrollment key lives in its own metadata entry, which is
+  # ignored after create. A replaced key (any change to its arguments, or a
+  # -replace) therefore never lands in a running, already enrolled VM's
+  # metadata, where anything on the VM could read and use it.
+  #
+  # Metadata changes apply in place, but GCE runs a startup-script only at BOOT:
+  # an updated script takes effect on the instance's next boot (a reboot, or a
+  # stop/start — not on apply, and not on suspend/resume). After an apply that
+  # changes provisioning, reboot or cold-restart the VM once (see
+  # docs/operations.md, "Applying provisioning changes").
+
   lifecycle {
-    # The startup-script embeds a single-use auth key that is consumed on first
-    # boot; don't recreate the VM just because the key value later changes.
-    ignore_changes = [metadata["startup-script"]]
+    # Must equal local.ts_authkey_attr (ignore_changes cannot reference a local).
+    # The precondition below catches a change to the local, and config_test's
+    # TestTailscaleKeyEntryIsIgnored catches either side changing alone.
+    ignore_changes = [metadata["workbox-ts-authkey"]]
+
+    precondition {
+      condition     = local.ts_authkey_attr == "workbox-ts-authkey"
+      error_message = "local.ts_authkey_attr must match the ignore_changes literal in compute.tf, or a replaced enrollment key would reach the running VM."
+    }
   }
 }

@@ -38,6 +38,9 @@ locals {
   ts_tag           = try(local.cfg.tailscale.tag, "tag:${local.name}")
   ts_user          = try(local.cfg.tailscale.user, "")
   ts_manage_policy = try(local.cfg.tailscale.manage_policy, false)
+  # Instance metadata key holding the enrollment key; must match the literal in
+  # compute.tf's ignore_changes (which cannot reference a local).
+  ts_authkey_attr = "workbox-ts-authkey"
 
   # SSH destination for `workbox ssh` / the ssh_target output; mirrors
   # Defaults(), which falls back to the hostname when ssh_target is empty.
