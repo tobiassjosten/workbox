@@ -75,6 +75,12 @@ workbox doctor           # read-only diagnostics
   build, terraform fmt/validate). It never touches cloud infrastructure.
   `golangci-lint` (v2) is a required tool — install it per the README before
   running `make check`/`make lint`.
+- **Keep `README.md` in sync with user-facing behavior, in the same change.** Any
+  change to the CLI command surface (`cmd/workbox`), the config schema
+  (`internal/config` / `workbox.example.yaml`), the scheduling/auto-suspend model,
+  or the setup flow must update the matching README section (CLI reference,
+  Configuration, Daily usage, Architecture) as part of the same work — not later.
+  Treat a stale README as a failing check.
 - **Never** run `terraform apply`, `terraform destroy`, or any cloud-mutating
   command unless the human explicitly asks.
 - Don't print or read credentials/secret material unnecessarily.
