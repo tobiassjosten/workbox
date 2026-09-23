@@ -28,7 +28,9 @@ locals {
   image_family  = coalesce(try(local.cfg.gcp.image_family, ""), "ubuntu-2404-lts-amd64")
   image_project = coalesce(try(local.cfg.gcp.image_project, ""), "ubuntu-os-cloud")
 
-  deletion_protection = try(local.cfg.gcp.deletion_protection, true)
+  # coalesce (not a bare try) so an explicit YAML null defaults to true as it
+  # does in config.Defaults(); an explicit false still disables protection.
+  deletion_protection = coalesce(try(local.cfg.gcp.deletion_protection, null), true)
 
   linux_user     = local.cfg.machine.linux_user
   ssh_public_key = trimspace(file(pathexpand(local.cfg.machine.ssh_public_key_file)))
