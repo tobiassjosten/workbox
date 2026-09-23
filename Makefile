@@ -78,8 +78,19 @@ gofmt-check: ## Fail if any Go file is not gofmt-clean
 	@out="$$(gofmt -l .)"; \
 	if [ -n "$$out" ]; then echo "gofmt needed on:"; echo "$$out"; exit 1; fi
 
+.PHONY: sh-check
+sh-check: ## Syntax-check the cloud-init template and the emitter it installs
+	@bash -n $(INFRA)/cloud-init.sh.tftpl
+	@# The emitter lives in a quoted heredoc, which bash -n treats as data, so
+	@# extract and check it separately. ${...} parses as a parameter expansion,
+	@# so no Terraform rendering is needed. An empty extraction means the
+	@# heredoc moved or was renamed: fail rather than report a check that did
+	@# not run (bash -n accepts empty input).
+	@emitter="$$(sed -n "/<<'ACTIVITY'/,/^ACTIVITY$$/p" $(INFRA)/cloud-init.sh.tftpl 		| sed '1d;$$d')"; 	[ -n "$$emitter" ] || 		{ echo "sh-check: no ACTIVITY heredoc in cloud-init.sh.tftpl"; exit 1; }; 	printf '%s\n' "$$emitter" | bash -n /dev/stdin
+	@echo "cloud-init.sh.tftpl: syntax OK (script and emitter)"
+
 .PHONY: check
-check: gofmt-check lint test build tf-fmt-check tf-validate ## All local validation (no cloud changes)
+check: gofmt-check lint test build sh-check tf-fmt-check tf-validate ## All local validation (no cloud changes)
 	@echo "all checks passed"
 
 ## -------------------------------------------------------------- terraform ---

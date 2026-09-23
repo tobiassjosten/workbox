@@ -422,7 +422,8 @@ make install        # go install; prints the install directory
 make test
 make lint
 make fmt
-make check          # gofmt + golangci-lint + test + build + terraform fmt/validate; no cloud changes
+make sh-check       # bash syntax of the cloud-init template and its emitter
+make check          # gofmt + golangci-lint + test + build + sh-check + terraform fmt/validate; no cloud changes
 make tf-init        # talks to the cloud
 make tf-fmt
 make tf-validate

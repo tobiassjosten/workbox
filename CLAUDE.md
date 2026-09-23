@@ -95,7 +95,8 @@ workbox doctor          # read-only diagnostics
 ## Working agreement
 
 - Run `make check` before declaring work complete (gofmt, golangci-lint, test,
-  build, terraform fmt/validate). It never touches cloud infrastructure.
+  build, cloud-init bash syntax, terraform fmt/validate). It never touches cloud
+  infrastructure.
   `golangci-lint` (v2) is a required tool — install it per the README before
   running `make check`/`make lint`.
 - **Keep `README.md` in sync with user-facing behavior, in the same change.** Any

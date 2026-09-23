@@ -47,6 +47,9 @@ jobs:
         with:
           terraform_version: "1.11.2"
 
+      - name: bash syntax (cloud-init template)
+        run: make sh-check
+
       - name: terraform fmt
         run: terraform -chdir=infra fmt -check -recursive
 
