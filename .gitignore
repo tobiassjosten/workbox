@@ -26,6 +26,8 @@ terraform.rc
 # --- Secrets and credentials (NEVER commit) ---
 .env
 .env.*
+# ...but keep the dummy example that documents which env vars are needed:
+!.env.example
 *.pem
 *.key
 *_key

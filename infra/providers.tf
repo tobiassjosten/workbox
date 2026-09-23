@@ -5,8 +5,9 @@
 # (never committed):
 #   export TAILSCALE_OAUTH_CLIENT_ID=...
 #   export TAILSCALE_OAUTH_CLIENT_SECRET=...
-# The OAuth client needs the auth_keys (write) scope with tag:workbox attached,
-# and — only if tailscale.manage_policy is true — the policy-file (write) scope.
+# The OAuth client needs the auth_keys (write) scope with your tailscale.tag
+# attached (defaults to tag:<name>, e.g. tag:workbox), and — only if
+# tailscale.manage_policy is true — the policy-file (write) scope.
 
 provider "google" {
   project = local.project
