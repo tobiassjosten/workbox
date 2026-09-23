@@ -221,7 +221,9 @@ Host workbox
 
 `ForwardAgent yes` lets Git on the VM authenticate to private repositories using
 your local ssh-agent — no key is ever stored on the VM. Omit it if you do not
-want agent forwarding.
+want agent forwarding. Only interactive sessions forward the agent;
+`workbox forward` tunnels never do. The most recent interactive login owns it,
+so if Git on the VM loses access, reconnect once.
 
 Connect and finish setup:
 
@@ -245,6 +247,30 @@ Or just use `workbox herdr` (equivalent to `herdr --remote workbox`). Herdr keep
 server, panes, and sessions on the VM; the local client attaches over OpenSSH, so
 sessions survive suspend/resume.
 
+## Reviewing a dev server in your browser
+
+The VM has **no public inbound**, so a dev server (Hugo, Vite, a local web app) is
+not reachable directly. `workbox forward` tunnels a local port to the same service
+on the VM's loopback over the existing Tailscale/SSH path, so you can open it in a
+local browser. Nothing is exposed on the tailnet — the VM side is always
+`localhost`, so the tunnel is the only way in.
+
+```sh
+# on the VM (e.g. in your Herdr session):
+hugo serve                       # binds 127.0.0.1:1313 as usual
+
+# on your local machine:
+workbox forward 1313             # then open http://localhost:1313
+workbox forward 1313 8080        # forward several ports at once
+workbox forward 8080:1313        # map local 8080 -> VM's 1313
+```
+
+`forward` checks that each local port is free (so a busy port fails before the VM
+is woken), wakes and waits for SSH like `ssh`/`herdr`, then holds the forwards open
+with no remote shell (`ssh -N`). Press Ctrl-C to close them. Because the dev server
+binds the VM's loopback, no per-project change and no `baseURL`/live-reload tweaks
+are needed — the browser sees a genuine `localhost`.
+
 ## CLI reference
 
 ```
@@ -254,6 +280,7 @@ workbox wake            # resume/start now; sets a stay-awake hold if the schedu
 workbox sleep           # (alias: workbox off) suspend now; stay-asleep hold if schedule wants awake
 workbox ssh [-- args]   # wake, wait, then hand off to your ssh client
 workbox herdr           # wake, wait, open Herdr (same as bare `workbox`)
+workbox forward PORT... # wake, wait, then hold local port-forwards to the VM open (browser review)
 workbox wake-at HH:MM   # one-workday wake override
 workbox sleep-at HH:MM  # one-workday sleep override (handles past-midnight like 01:30)
 workbox keep-awake 3h   # hold awake for a Go duration (3h, 90m)

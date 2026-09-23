@@ -3,6 +3,8 @@ package ssh
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"reflect"
 	"strconv"
 	"strings"
@@ -108,6 +110,84 @@ func TestProbeErr(t *testing.T) {
 	}
 }
 
+func TestCheckLocalPorts(t *testing.T) {
+	ln, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	busy := ln.Addr().(*net.TCPAddr).Port
+	if err := CheckLocalPorts([]Forward{{Local: busy, Remote: 80}}); err == nil ||
+		!strings.Contains(err.Error(), fmt.Sprintf("cannot bind local port %d", busy)) {
+		t.Errorf("CheckLocalPorts(busy) = %v, want a cannot-bind error", err)
+	}
+	// Once released, the same port is free again.
+	_ = ln.Close()
+	if err := CheckLocalPorts([]Forward{{Local: busy, Remote: 80}}); err != nil {
+		t.Errorf("CheckLocalPorts(free) = %v, want nil", err)
+	}
+}
+
+// ssh -L binds every address localhost resolves to, so a port held on either
+// loopback family must be reported busy.
+func TestCheckLocalPortsBothFamilies(t *testing.T) {
+	for _, host := range []string{"127.0.0.1", "[::1]"} {
+		t.Run(host, func(t *testing.T) {
+			ln, err := net.Listen("tcp", host+":0")
+			if err != nil {
+				t.Skipf("cannot listen on %s: %v", host, err)
+			}
+			defer func() { _ = ln.Close() }()
+			busy := ln.Addr().(*net.TCPAddr).Port
+			if err := CheckLocalPorts([]Forward{{Local: busy, Remote: 80}}); err == nil {
+				t.Errorf("CheckLocalPorts = nil, want a busy error for a port held on %s", host)
+			}
+		})
+	}
+}
+
+func TestForwardArgv(t *testing.T) {
+	got := forwardArgv(Target{Host: "workbox"}, []Forward{{Local: 8080, Remote: 1313}})
+	want := []string{
+		"ssh", "-N", "-o", "ExitOnForwardFailure=yes", "-o", "ForwardAgent=no",
+		"-o", "ControlMaster=no",
+		"-L", "localhost:8080:localhost:1313", "workbox",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("forwardArgv = %v, want %v", got, want)
+	}
+}
+
+func TestParseForward(t *testing.T) {
+	for _, tc := range []struct {
+		spec    string
+		want    Forward
+		wantArg string
+	}{
+		{"1313", Forward{Local: 1313, Remote: 1313}, "localhost:1313:localhost:1313"},
+		{"8080:1313", Forward{Local: 8080, Remote: 1313}, "localhost:8080:localhost:1313"},
+	} {
+		got, err := parseForward(tc.spec)
+		if err != nil {
+			t.Errorf("parseForward(%q) unexpected error: %v", tc.spec, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("parseForward(%q) = %+v, want %+v", tc.spec, got, tc.want)
+		}
+		if got.Arg() != tc.wantArg {
+			t.Errorf("parseForward(%q).Arg() = %q, want %q", tc.spec, got.Arg(), tc.wantArg)
+		}
+	}
+}
+
+func TestParseForwardInvalid(t *testing.T) {
+	for _, spec := range []string{"", "abc", "0", "70000", "8080:", "8080:abc", "1:2:3"} {
+		if _, err := parseForward(spec); err == nil {
+			t.Errorf("parseForward(%q) expected error, got nil", spec)
+		}
+	}
+}
+
 func TestWaitReachableTimeout(t *testing.T) {
 	// 198.51.100.1 is an RFC 5737 documentation address (never routed).
 	// interval > timeout so exactly one probe runs before the deadline fires.
@@ -177,5 +257,18 @@ func TestWaitReachableCancelled(t *testing.T) {
 	err := WaitReachable(ctx, target, 5*time.Second, 10*time.Second, 100*time.Millisecond)
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("expected context.Canceled, got %v", err)
+	}
+}
+
+func TestParseForwardsRejectsDuplicateLocalPort(t *testing.T) {
+	if _, err := ParseForwards([]string{"1313", "1313:8080"}); err == nil {
+		t.Error("expected an error for a local port forwarded twice")
+	}
+	got, err := ParseForwards([]string{"1313", "8080:80"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []Forward{{Local: 1313, Remote: 1313}, {Local: 8080, Remote: 80}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("ParseForwards = %v, want %v", got, want)
 	}
 }

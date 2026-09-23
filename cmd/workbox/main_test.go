@@ -5,6 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -64,3 +68,44 @@ func TestDiagnoseUnreachable(t *testing.T) {
 }
 
 // Each retired command explains its replacement instead of failing with a bare
+
+func TestRunForwardChecksPortsBeforeWaking(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "id.pub")
+	if err := os.WriteFile(keyPath, []byte("ssh-ed25519 AAAA test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, "config.yaml")
+	cfg := fmt.Sprintf(`name: workbox
+gcp:
+  project_id: p
+  region: r
+  zone: z
+  machine_type: m
+  boot_disk_gb: 30
+  data_disk_gb: 200
+machine:
+  linux_user: developer
+  ssh_public_key_file: %s
+tailscale:
+  hostname: workbox
+schedule:
+  timezone: Europe/Stockholm
+  wake: "06:00"
+  sleep: "23:00"
+`, keyPath)
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	busy := ln.Addr().(*net.TCPAddr).Port
+
+	err = runForward(context.Background(), cfgPath, []string{strconv.Itoa(busy)})
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("cannot bind local port %d", busy)) {
+		t.Fatalf("runForward = %v, want a cannot-bind error", err)
+	}
+}

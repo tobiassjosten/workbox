@@ -139,6 +139,23 @@ func newRootCmd() *cobra.Command {
 		RunE:  appCmd(&cfgPath, func(ctx context.Context, a *cli.App, args []string) error { return a.SleepAt(ctx, args[0]) }),
 	})
 
+	// forward
+	root.AddCommand(&cobra.Command{
+		Use:   "forward PORT [PORT...]",
+		Short: "Wake if needed, wait for SSH, then hold local port-forwards to the VM open",
+		Long: "Tunnel one or more local ports to services on the VM's loopback so you can\n" +
+			"review them in a local browser (e.g. `workbox forward 1313` for `hugo serve`).\n" +
+			"Each PORT is either \"PORT\" (same port both ends) or \"LOCAL:REMOTE\". The VM\n" +
+			"side is always localhost, so nothing is exposed beyond the tunnel. The session\n" +
+			"holds the forwards open with no remote shell; press Ctrl-C to close them.",
+		Args: cobra.MinimumNArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			ctx, cancel := signalContext()
+			defer cancel()
+			return runForward(ctx, cfgPath, args)
+		},
+	})
+
 	// keep-awake
 	root.AddCommand(&cobra.Command{
 		Use:   "keep-awake DURATION",
@@ -346,6 +363,33 @@ func runSSH(ctx context.Context, cfgPath string, extra []string) error {
 		return err
 	}
 	return ssh.Exec(sshTarget(cfg), extra...)
+}
+
+// runForward wakes, waits, then replaces the process with a non-interactive ssh
+// session that holds one or more local port-forwards open. It lets the user
+// review a dev server bound to the VM's loopback in a local browser without
+// exposing any port beyond the tunnel; Ctrl-C closes the forwards.
+func runForward(ctx context.Context, cfgPath string, specs []string) error {
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return err
+	}
+	forwards, err := ssh.ParseForwards(specs)
+	if err != nil {
+		return err
+	}
+	// Fail on a busy local port before waking (and billing) the VM.
+	if err := ssh.CheckLocalPorts(forwards); err != nil {
+		return err
+	}
+	if err := wakeAndWait(ctx, cfg); err != nil {
+		return err
+	}
+	for _, f := range forwards {
+		fmt.Fprintf(os.Stderr, "Forwarding localhost:%d -> VM localhost:%d\n", f.Local, f.Remote)
+	}
+	fmt.Fprintln(os.Stderr, "Holding forwards open; press Ctrl-C to close.")
+	return ssh.ExecForward(sshTarget(cfg), forwards)
 }
 
 // runDoctor runs read-only diagnostics. With wake=true it first wakes the VM and

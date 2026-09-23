@@ -2,15 +2,18 @@
 // implements an SSH stack in Go: connectivity checks and interactive sessions
 // both run the system `ssh`, so the user inherits ~/.ssh/config, ssh-agent,
 // known_hosts, ProxyJump and ControlMaster exactly as usual (the non-interactive
-// probes opt out of multiplexing entirely; see RemoteArgs).
+// probes opt out of multiplexing entirely, and `forward` never becomes the
+// master; see RemoteArgs and ExecForward).
 package ssh
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -181,4 +184,136 @@ func Exec(t Target, extra ...string) error {
 	argv := append([]string{"ssh"}, t.baseArgs()...)
 	argv = append(argv, extra...)
 	return syscall.Exec(path, argv, os.Environ())
+}
+
+// Forward is a local→VM port forward: a local port tunneled to the same service
+// listening on the VM's loopback. Because the VM side is always localhost, the
+// forwarded service is only ever reachable through this tunnel — nothing is
+// exposed on the tailnet or anywhere else.
+type Forward struct {
+	Local  int
+	Remote int
+}
+
+// Arg renders the forward as the value for ssh's -L option. The local end is
+// bound explicitly to localhost so the tunnel is never published on other
+// interfaces, whatever the user's GatewayPorts setting says.
+func (f Forward) Arg() string {
+	return fmt.Sprintf("localhost:%d:localhost:%d", f.Local, f.Remote)
+}
+
+// ParseForwards parses several port specs, rejecting a local port used twice:
+// ssh would only fail on that after connecting (ExitOnForwardFailure), which for
+// workbox means after the wake and the wait for SSH.
+func ParseForwards(specs []string) ([]Forward, error) {
+	forwards := make([]Forward, 0, len(specs))
+	seen := make(map[int]bool, len(specs))
+	for _, s := range specs {
+		f, err := parseForward(s)
+		if err != nil {
+			return nil, err
+		}
+		if seen[f.Local] {
+			return nil, fmt.Errorf("local port %d is forwarded twice", f.Local)
+		}
+		seen[f.Local] = true
+		forwards = append(forwards, f)
+	}
+	return forwards, nil
+}
+
+// CheckLocalPorts reports the first local forward port that cannot be bound
+// (typically already in use), so `workbox forward` can fail before waking the
+// VM rather than after, when ssh's ExitOnForwardFailure would trip. ssh's -L
+// binds every address "localhost" resolves to, so both loopback families are
+// checked: binding the name alone would pick one and miss a port held on the
+// other.
+func CheckLocalPorts(forwards []Forward) error {
+	for _, f := range forwards {
+		for _, host := range []string{"127.0.0.1", "::1"} {
+			ln, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(f.Local)))
+			if err != nil {
+				// A host without this family cannot serve the forward on it
+				// either, so skip it rather than reporting the port busy.
+				if unsupportedFamily(err) {
+					continue
+				}
+				return fmt.Errorf("cannot bind local port %d: %w", f.Local, err)
+			}
+			_ = ln.Close() // released immediately; ssh binds it again
+		}
+	}
+	return nil
+}
+
+// unsupportedFamily reports whether err means the address family is unavailable
+// on this host (e.g. IPv6 disabled), as opposed to the port being taken.
+func unsupportedFamily(err error) bool {
+	return errors.Is(err, syscall.EAFNOSUPPORT) || errors.Is(err, syscall.EADDRNOTAVAIL)
+}
+
+// parseForward parses a friendly port spec into a Forward. It accepts "PORT"
+// (same port on both ends, the common case) or "LOCAL:REMOTE" to map a local
+// port to a different port on the VM.
+func parseForward(spec string) (Forward, error) {
+	fields := strings.Split(spec, ":")
+	var local, remote string
+	switch len(fields) {
+	case 1:
+		local, remote = fields[0], fields[0]
+	case 2:
+		local, remote = fields[0], fields[1]
+	default:
+		return Forward{}, fmt.Errorf("invalid port forward %q: expected \"PORT\" or \"LOCAL:REMOTE\"", spec)
+	}
+	lp, err := parsePort(local)
+	if err != nil {
+		return Forward{}, fmt.Errorf("invalid port forward %q: %w", spec, err)
+	}
+	rp, err := parsePort(remote)
+	if err != nil {
+		return Forward{}, fmt.Errorf("invalid port forward %q: %w", spec, err)
+	}
+	return Forward{Local: lp, Remote: rp}, nil
+}
+
+func parsePort(s string) (int, error) {
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, fmt.Errorf("port %q is not a number", s)
+	}
+	if n < 1 || n > 65535 {
+		return 0, fmt.Errorf("port %d out of range 1-65535", n)
+	}
+	return n, nil
+}
+
+// ExecForward replaces the current process with a non-interactive ssh session
+// that holds the given local port forwards open (ssh -N, no remote shell) until
+// interrupted. The argument list, and the reasoning behind its options, is in
+// forwardArgv. It only returns on failure to start.
+func ExecForward(t Target, forwards []Forward) error {
+	path, err := exec.LookPath("ssh")
+	if err != nil {
+		return fmt.Errorf("ssh client not found on PATH: %w", err)
+	}
+	return syscall.Exec(path, forwardArgv(t, forwards), os.Environ())
+}
+
+// forwardArgv builds the full argv (including argv[0]) for ExecForward. Options
+// precede the destination so this works regardless of whether the local OpenSSH
+// permutes arguments. ExitOnForwardFailure makes ssh fail loudly if a local port
+// is already in use rather than connect silently without the tunnel.
+// ForwardAgent=no keeps the tunnel from ever claiming the VM's forwarded-agent
+// link. ControlMaster=no keeps the tunnel from ever becoming the multiplexing
+// master: as master it would own the user's other sessions (Ctrl-C here would
+// drop them) and could leave a master connection behind that the activity
+// emitter counts, holding the VM awake. Riding an existing master is fine; that
+// one is already counted.
+func forwardArgv(t Target, forwards []Forward) []string {
+	argv := []string{"ssh", "-N", "-o", "ExitOnForwardFailure=yes", "-o", "ForwardAgent=no", "-o", "ControlMaster=no"}
+	for _, f := range forwards {
+		argv = append(argv, "-L", f.Arg())
+	}
+	return append(argv, t.baseArgs()...)
 }

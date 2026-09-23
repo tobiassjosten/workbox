@@ -74,6 +74,10 @@ bootstrap wires up **ssh-agent forwarding** — never a stored key:
   that concurrent logins steal the link from each other — a second login repoints
   the path, so the last to log in owns the agent; keep a single active forwarding
   connection. Shells adopt the path only while it points at a live socket.
+- Only interactive logins (`workbox`, `workbox ssh`, `workbox herdr`) claim the
+  agent. The CLI's reachability probe and `workbox forward` tunnels pass
+  `ForwardAgent=no`, so they never repoint the link to a connection that is
+  about to close or that carries no agent.
 - **Only a socket symlink lives on the VM — still no key material.** While a
   forwarding connection is open, the agent is reachable by anything running as
   the dev user, which is consistent with the threat model (that identity is
