@@ -66,6 +66,9 @@ Tailscale account. Those must already exist.
    export TAILSCALE_TAILNET=...
    ```
 
+   Or copy `.env.example` to `.env.local` (git-ignored), fill it in, and load it
+   with `. ./.env.local`.
+
 4. **Merge the tailnet policy fragment** (required when `manage_policy: false`, the
    default). See [Safe tailnet policy setup](#safe-tailnet-policy-setup). The
    `tagOwners` entry for `tag:workbox` **must** exist before you apply Terraform.
@@ -176,7 +179,8 @@ Set the ADC quota project to your GCP project.
 
 Create an OAuth client with these scopes:
 
-- **auth_keys (write)**, with **`tag:workbox` attached to the client**
+- **auth_keys (write)**, with your **`tailscale.tag`** attached to the client
+  (defaults to `tag:<name>`, e.g. `tag:workbox`)
 - **policy-file (write)** — only if `manage_policy: true`
 
 Provide the credentials through environment variables (never commit them):
