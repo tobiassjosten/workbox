@@ -386,6 +386,11 @@ Then verify:
 - The SSH host resolves via MagicDNS
 - The operator role has been granted to your identity
 - `herdr` and `claude` are present on the VM
+- After upgrading or changing provisioning, the VM was rebooted or cold-restarted
+  once so the startup-script (including the activity emitter) ran — see
+  [docs/operations.md](docs/operations.md#applying-provisioning-changes); when
+  upgrading from `schedule.wake`/`schedule.sleep`, follow
+  [the upgrade steps](docs/operations.md#upgrading-from-schedulewakesleep)
 
 ## Destroying everything
 
@@ -398,6 +403,7 @@ Then verify:
 ## Documentation
 
 - [docs/architecture.md](docs/architecture.md) — the two planes in detail
-- [docs/operations.md](docs/operations.md) — VM rebuild, disk detach/reattach,
-  snapshot restore
+- [docs/operations.md](docs/operations.md) — auto-suspend and holds, applying
+  provisioning changes, upgrade steps, VM rebuild, disk detach/reattach, snapshot
+  restore
 - [docs/security.md](docs/security.md) — the full security model
