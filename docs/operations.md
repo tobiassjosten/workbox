@@ -11,71 +11,125 @@ workbox            # wake, wait for SSH, open Herdr (the usual morning command)
 workbox wake       # resume/start now
 workbox sleep      # suspend now  (alias: workbox off)
 workbox status     # human-readable VM + schedule state
-workbox status --json   # stable machine-readable form
+workbox status --json   # machine-readable form (fields in README, "workbox status --json")
 ```
 
-Both `wake` and `sleep` are idempotent: `wake` does nothing if already `RUNNING`,
-resumes if `SUSPENDED`, starts if `TERMINATED`, and waits out transitional states;
-`sleep` does nothing if already `SUSPENDED`/`TERMINATED`.
+`wake` is idempotent: it does nothing if already `RUNNING`, resumes if
+`SUSPENDED`, starts if `TERMINATED`, and waits out transitional states. `sleep`
+skips the suspend if already `SUSPENDED`/`TERMINATED` but still clears the
+keep-awake hold and scheduled sleep.
 
-### Manual actions do not fight the scheduler
+## Wake manually, sleep on idle
 
-The reconciler runs every minute. To stop it undoing a manual action, `wake`,
-`sleep` and `keep-awake` set a temporary **hold**:
+The machine is **always woken by hand** — `workbox` or `workbox wake`. It then
+**suspends itself** once nothing is happening. The reconciler runs every minute
+and only ever *suspends* a running VM; it never wakes one. Two independent,
+optional controls decide when it may suspend:
 
-- `workbox wake` at 01:00 (baseline says asleep) → resumes **and** holds awake
-  until the next scheduled sleep, so the reconciler won't re-suspend it.
-- `workbox sleep` at 22:00 (baseline says awake until 23:00) → suspends **and**
-  holds asleep until the next scheduled wake.
-- When the baseline already agrees (e.g. `wake` at 10:00), no hold is created.
+1. **Working hours** — an optional recurring window (e.g. `06:00–23:00` in your
+   timezone) during which automatic suspend is disabled. Inside it the VM stays
+   up regardless of activity. Working hours never wake the VM; they only hold off
+   sleep.
+2. **Idle shutdown** — outside working hours (or when no window is configured),
+   the VM suspends after `idle_timeout_minutes` (default 30) of **inactivity**.
+   Activity means either a herdr agent in the `working` state or any open
+   inbound SSH connection — including a `workbox forward` tunnel and an attached
+   Herdr client; a `blocked`/`idle`/`done` agent does not count. Close those to
+   let the VM sleep. A lingering OpenSSH `ControlPersist` master is an open
+   connection too and holds the VM awake until it closes; keep `ControlPersist`
+   short for the workbox host if you use multiplexing. Workbox's own probes
+   never open one. Long-running commands that are not a Herdr agent (a build in
+   a pane, `nohup`, detached containers) do **not** count: run
+   `workbox keep-awake 2h` before walking away from one. Idle time counts from
+   the later of the last activity and the instance's last start
+   (`lastStartTimestamp`), so a freshly started VM — first provisioning, a
+   Terraform replacement, a Console start — always gets the full timeout.
 
-Holds are shown in `workbox status` and expire on their own.
+Both are set in `schedule` in `~/.config/workbox/config.yaml` (see
+`workbox.example.yaml`). Set `idle_timeout_minutes: 0` to disable idle shutdown;
+omit `working_hours` (or set `enabled: false`) to apply idle shutdown around the
+clock.
 
-## Schedule: temporary overrides
-
-Normal schedule is `06:00–23:00 Europe/Stockholm`. Override a single workday
-without changing the baseline:
+### Grace, holds and one-off sleep
 
 ```bash
-workbox sleep-at 01:30   # stay up past midnight tonight; back to normal tomorrow
-workbox sleep-at 20:00   # sleep early tonight only
-workbox wake-at 08:30    # sleep in tomorrow (next wake delayed to 08:30)
-workbox wake-at 05:00    # wake early for the next workday
-workbox keep-awake 3h    # keep awake for at least three hours (Go duration)
-workbox cancel-override  # clear all overrides and holds; back to normal
-workbox schedule         # normal schedule, active override/hold, next transitions
+workbox wake             # resume now; a short keep-awake grace covers startup
+workbox sleep            # suspend now (alias: workbox off); clears hold + scheduled sleep
+workbox sleep 20:00      # one-off: suspend tonight at 20:00 (also accepts 2000)
+workbox keep-awake 3h    # wake if needed, then stay awake for a duration
+workbox cancel           # clear the scheduled sleep and keep-awake hold
+workbox schedule         # working hours, idle setting, hold and scheduled sleep
 ```
 
-Each override resolves `HH:MM` to an absolute timestamp on the nearest relevant
-day — the command prints the resolved time and timezone so there is no ambiguity
-(e.g. `sleep-at 01:30` in the evening resolves to **tomorrow** 01:30). Overrides
-are one-shot and expire automatically; future days return to the baseline.
+- `workbox wake` sets a keep-awake **grace** of the idle timeout plus the SSH
+  wait timeout (`ssh.wait_timeout_seconds`), so a freshly woken VM isn't
+  suspended while it resumes or before the activity emitter first reports. With
+  idle shutdown disabled there is no grace: it only guards against idle
+  shutdown, and a scheduled sleep wins over a hold regardless.
+  The startup script also reports activity when it starts, once a minute for up
+  to an hour while it runs, and when it finishes.
+- `workbox sleep 20:00` schedules a one-off suspend at the next 20:00; it fires
+  **even within working hours**. Run `workbox cancel` before then to call it off
+  (this also clears any keep-awake hold), or just `workbox wake` afterwards — a
+  manual wake cancels a scheduled sleep that is currently in effect. It expires
+  at the next working-hours start — which can be days away when
+  `working_hours.days` is restricted, so a Friday 20:00 sleep covers the weekend
+  — or after 8 h when working hours are absent or disabled.
+- `workbox sleep HH:MM` leaves a keep-awake hold in place; where the two overlap,
+  the scheduled sleep wins (see precedence below). `workbox keep-awake` cancels
+  a scheduled sleep only when the new hold runs past its start.
+- `workbox keep-awake` also **resumes a suspended VM**, so arming a hold for a
+  later session starts the machine (and its billing) now.
 
-**Precedence:** `manual hold > one-workday override > baseline`.
+**Precedence:** `scheduled sleep > keep-awake hold > working hours > idle
+shutdown`. A manual `workbox sleep` always suspends now, and — because the
+reconciler never auto-wakes — it stays asleep until you wake it again.
 
-### Worked timeline
+### Changing working hours
 
-Suppose it is 21:00 and you run `workbox sleep-at 01:30`:
+Working hours live in config and are baked into the reconciler at apply time:
 
-```
-20:00 ────────── 23:00 ───────── 01:30 ───────── 06:00
-       baseline    │  override:    │  baseline      │  baseline
-        awake      │  stay AWAKE   │   asleep       │   wake
-                   └─ normal sleep suppressed ──┘
-```
+1. Edit `schedule.working_hours` / `schedule.idle_timeout_minutes` /
+   `schedule.timezone` in `~/.config/workbox/config.yaml`.
+2. `make tf-apply` — Terraform re-renders the reconciler Workflow.
 
-The reconciler keeps the VM awake through 01:30, then suspends it; 06:00 the next
-morning wakes as usual. The following night's 23:00 sleep is unaffected.
+## Applying provisioning changes
 
-## Schedule: permanent changes
+The VM's startup-script (activity emitter, swapfile, sshd settings, tooling) is
+Terraform-managed, but GCE runs it only at boot — not on `terraform apply` and not
+on suspend/resume. After an apply that changes it, boot the VM once so it takes
+effect: `sudo reboot` on the VM is the cheapest, or stop the instance (Console or
+`gcloud compute instances stop`) and `workbox wake`. Alternatively, run
+`sudo google_metadata_script_runner startup` on the VM without rebooting.
 
-Editing the recurring 06:00/23:00 at runtime would create drift. To change it
-permanently:
+`workbox doctor` warns when the emitter's timer is not active.
 
-1. Edit `schedule.wake` / `schedule.sleep` (or `schedule.timezone`) in
-   `~/.config/workbox/config.yaml`.
-2. `make tf-apply` — Terraform re-renders the reconciler Workflow with the new
-   baseline.
+### Upgrading from schedule.wake/sleep
+
+The CLI and the reconciler deploy separately, and a running VM predates the
+activity emitter, so upgrade in this order:
+
+1. Migrate the config: replace `schedule.wake`/`schedule.sleep` with
+   `schedule.working_hours.start`/`end` (both the CLI and Terraform refuse the
+   old keys).
+2. `workbox keep-awake 1h`. Until the emitter runs, the new reconciler sees no
+   activity, and a VM started long ago has no boot grace left, so without a hold
+   it is suspended outside working hours on the first tick after the apply —
+   even during your SSH session. This save also replaces the old state document,
+   dropping its legacy fields.
+3. `make tf-apply` right away: until then the old reconciler keeps running its
+   baseline schedule and ignores the new CLI's scheduled sleeps.
+4. `sudo reboot` on the VM, so the startup script installs the activity emitter.
+5. `workbox doctor` to confirm the activity emitter and signal; `workbox cancel`
+   if you want to drop the hold early.
+
+Scripts reading `workbox status --json` need updating too: `hold` is now
+`keep_awake`; `desired`, `next_transition`, `next_wake`, `next_sleep`,
+`wake_override` and `sleep_override` are gone; and
+`schedule.wake`/`schedule.sleep` are replaced by `schedule.working_hours`
+and `schedule.idle_timeout_minutes`. The new `auto_suspend`, `activity` and
+`scheduled_sleep` fields carry the verdict and state instead (see
+"workbox status --json" in the README).
 
 ## Diagnostics
 
@@ -85,10 +139,11 @@ workbox doctor
 
 Read-only. It checks: config parses; GCP ADC works; the instance is readable;
 local `tailscale`, `ssh` and `herdr` exist; and — only if the VM is already
-`RUNNING` — SSH reachability and the presence of remote `herdr`, `claude` and the
-Herdr/Claude integration hook. By default it never wakes a sleeping VM; pass `--wake` to first wake the
-VM so the remote SSH/Herdr/Claude checks can run. Failures print a
-remediation hint.
+`RUNNING` — SSH reachability, the presence of remote `herdr`, `claude` and the
+Herdr/Claude integration hook, that the activity emitter's timer is active and
+its last run succeeded, and that a last-active value is actually readable. By
+default it never wakes a sleeping VM; pass `--wake` to first wake the VM so the
+remote checks can run. Failures print a remediation hint.
 
 ### Tailscale / SSH not working
 
@@ -197,17 +252,19 @@ auto-transitions to `TERMINATED` and the **preserved memory/process state is
 lost** (the disks persist). Practical implications:
 
 - After a very long suspension, `workbox wake` will `start` the instance (a fresh
-  boot) rather than `resume` it — the reconciler and CLI handle both paths
-  automatically, so nothing breaks, but in-memory Herdr/Claude sessions are gone.
+  boot) rather than `resume` it — `wake` handles both paths automatically, so
+  nothing breaks, but in-memory Herdr/Claude sessions are gone.
 - Treat suspend as an overnight/weekend convenience, not durable storage. Push
   work to Git regularly; the data disk and its snapshots are the durable layer.
 
 ## Inspecting operational state
 
-`workbox status` and `workbox schedule` show the active override and hold.
-`workbox cancel-override` clears them by deleting the Firestore state document.
-The reconciler also deletes the document once every span has expired, so state
-does not accumulate.
+`workbox status` and `workbox schedule` show the keep-awake hold and any
+scheduled sleep; `status` also shows the last-active time and the current
+auto-suspend verdict. `workbox cancel` clears the hold and scheduled sleep by
+deleting the Firestore state document. The reconciler also deletes the document
+once every span has expired (on a tick where the VM is running), so state does
+not accumulate.
 
 ## Remote state (GCS backend)
 

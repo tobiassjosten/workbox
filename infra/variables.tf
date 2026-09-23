@@ -17,7 +17,7 @@ variable "services_region" {
 
 variable "reconcile_interval" {
   type        = string
-  description = "Cloud Scheduler cron for the reconciler. Every minute keeps transitions punctual and stays within free tiers."
+  description = "Cloud Scheduler cron for the reconciler. Every minute keeps idle-suspend punctual (the 5-minute idle_timeout_minutes minimum assumes it) and stays within free tiers."
   default     = "* * * * *"
   validation {
     condition     = length(trimspace(var.reconcile_interval)) > 0

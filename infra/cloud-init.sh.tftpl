@@ -13,13 +13,131 @@ DATA_DEV="/dev/disk/by-id/google-${data_device_name}"
 DATA_MOUNT="${data_mount}"
 LOG() { echo "[workbox-bootstrap] $*"; }
 
+# Report provisioning as activity (the same guest attribute the emitter below
+# writes), so a boot counts as activity even before the emitter's first tick.
+# The reconciler also counts idle time from the instance's lastStartTimestamp;
+# this additionally covers boots that may not update it (a guest `sudo reboot`).
+# Non-fatal: provisioning must not stop over a missed report.
+report_activity() {
+  curl -sS -f --max-time 5 -X PUT --data "$(date +%s)" -H "Metadata-Flavor: Google" \
+    "http://metadata.google.internal/computeMetadata/v1/instance/guest-attributes/${activity_key}" \
+    >/dev/null || LOG "activity report failed (non-fatal)"
+}
+report_activity
+
+# Keep reporting while the script runs. Installing packages, Docker, Tailscale
+# and the user tooling can take far longer than a short idle timeout, and until
+# the timer-driven emitter has something to report (an SSH session or a working
+# agent) nothing else would — so the reconciler would suspend a VM in the middle
+# of provisioning, and suspend preserves memory, so the script would freeze
+# mid-run (with broken in-flight downloads) until someone wakes it by hand.
+# The trap stops the heartbeat on any normal or `set -e` exit; the kill -0
+# check also stops it if the script is SIGKILLed (no trap runs then), and the
+# hour cap hands a wedged-but-alive run back to idle shutdown rather than
+# holding a billable VM up forever.
+MAIN_PID=$$
+report_activity_loop() {
+  local i=0
+  while [ "$${i}" -lt 60 ] && kill -0 "$${MAIN_PID}" 2>/dev/null; do
+    sleep 60
+    report_activity
+    i=$(( i + 1 ))
+  done
+}
+report_activity_loop &
+HEARTBEAT_PID=$!
+stop_heartbeat() { kill "$${HEARTBEAT_PID}" 2>/dev/null || true; }
+trap stop_heartbeat EXIT
+
 LOG "timezone"
 timedatectl set-timezone "${timezone}" || true
 
 LOG "base packages"
 apt-get update -y
 apt-get install -y \
-  git curl ca-certificates build-essential jq ripgrep tmux unzip gnupg lsb-release
+  git curl ca-certificates build-essential jq iproute2 ripgrep tmux unzip gnupg lsb-release
+
+# --- Activity emitter -------------------------------------------------------
+# Reports "last active" to guest attributes so the reconciler can idle-suspend
+# the VM. Active = any herdr agent is 'working', OR any established inbound SSH
+# connection (an interactive session, a `workbox forward` tunnel, an attached
+# Herdr client). It writes the current unix time to the guest-attributes key
+# ${activity_key}; the metadata server authorizes the write for the instance
+# itself (enable-guest-attributes=TRUE, no SA role needed). The key is the
+# contract with internal/compute.LastActiveQueryPath and the reconciler
+# (infra/reconcile.yaml.tftpl).
+# Installed right after the base packages (it needs jq and ss from iproute2),
+# before the other steps: without the emitter the reconciler sees no activity
+# and suspends the VM, so a later failure (Docker apt repo, tailscale up) must
+# not skip it. It copes with herdr not being installed yet.
+LOG "activity emitter"
+cat > /usr/local/bin/workbox-activity <<'ACTIVITY'
+#!/usr/bin/env bash
+set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+active=0
+
+# At least one established inbound SSH connection (port 22), of any kind.
+# Checked first: it is cheap and cannot hang. Capture rather than pipe to
+# grep -q, which can SIGPIPE ss under pipefail.
+if [ -n "$(ss -tnH state established '( sport = :22 )' 2>/dev/null)" ]; then
+  active=1
+fi
+
+# Any herdr agent currently working? Bounded so a wedged herdr server can't
+# stall the emitter.
+if [ "$active" -eq 0 ] && command -v herdr >/dev/null 2>&1; then
+  if timeout 15 herdr agent list 2>/dev/null \
+    | jq -e '(.result.agents // []) | any(.agent_status == "working")' >/dev/null 2>&1; then
+    active=1
+  fi
+fi
+
+[ "$active" -eq 1 ] || exit 0
+
+# A failed write is the failure that matters (guest attributes disabled, metadata
+# server rejecting the PUT), so let it fail the unit: -sS keeps curl's error in
+# the journal, and `systemctl is-failed` then trips `workbox doctor`. The timer
+# self-heals — a transient failure clears on the next tick.
+curl -sS -f --max-time 5 -X PUT --data "$(date +%s)" -H "Metadata-Flavor: Google" \
+  "http://metadata.google.internal/computeMetadata/v1/instance/guest-attributes/${activity_key}" \
+  >/dev/null
+ACTIVITY
+chmod 0755 /usr/local/bin/workbox-activity
+
+cat > /etc/systemd/system/workbox-activity.service <<SERVICE
+[Unit]
+Description=workbox activity emitter (reports last-active to guest attributes)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# oneshot units have no start timeout by default; a hung run would block every
+# later timer tick and stop activity reports, so bound it.
+TimeoutStartSec=30s
+# systemd sets HOME for User= at run time, so the dev user (created by the guest
+# agent, possibly after this script starts) need not exist yet.
+User=$${LINUX_USER}
+ExecStart=/usr/local/bin/workbox-activity
+SERVICE
+
+cat > /etc/systemd/system/workbox-activity.timer <<'TIMER'
+[Unit]
+Description=Run the workbox activity emitter every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target
+TIMER
+
+systemctl daemon-reload
+systemctl enable --now workbox-activity.timer || LOG "activity timer enable failed (non-fatal)"
 
 # --- Swap (memory cushion) --------------------------------------------------
 # A swapfile turns a memory spike into slowness instead of an OOM-killed session
@@ -136,6 +254,14 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 ChallengeResponseAuthentication no
 PermitRootLogin no
+# Drop dead sessions (laptop asleep, off the tailnet) within ~3 min so a stale
+# ESTABLISHED socket stops counting as an open connection for the activity
+# emitter.
+ClientAliveInterval 60
+ClientAliveCountMax 3
+# An unauthenticated connection also counts as activity (the emitter sees the
+# socket, not the session), so keep the window short. See docs/security.md.
+LoginGraceTime 30
 SSHD
 # The configured public key is installed by the guest agent from instance
 # metadata (ssh-keys); no private key is ever placed on this VM.
@@ -258,4 +384,6 @@ fi
 run_as_user 'export PATH="$HOME/.local/bin:$PATH"; command -v herdr >/dev/null 2>&1 && herdr integration install claude' \
   || LOG "herdr integration install skipped (non-fatal)"
 
+stop_heartbeat
+report_activity
 LOG "bootstrap complete"

@@ -71,20 +71,13 @@ func newRootCmd() *cobra.Command {
 	// status
 	statusCmd := &cobra.Command{
 		Use:   "status",
-		Short: "Show the current VM and schedule state",
-		RunE: func(_ *cobra.Command, _ []string) error {
-			ctx, cancel := signalContext()
-			defer cancel()
-			app, cleanup, err := newApp(ctx, cfgPath)
-			if err != nil {
-				return err
-			}
-			defer cleanup()
+		Short: "Show the VM state, working hours, activity and the auto-suspend verdict",
+		RunE: appCmd(&cfgPath, func(ctx context.Context, a *cli.App, _ []string) error {
 			if jsonOut {
-				return app.PrintStatusJSON(ctx)
+				return a.PrintStatusJSON(ctx)
 			}
-			return app.PrintStatus(ctx)
-		},
+			return a.PrintStatus(ctx)
+		}),
 	}
 	statusCmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable JSON")
 	root.AddCommand(statusCmd)
@@ -92,16 +85,17 @@ func newRootCmd() *cobra.Command {
 	// wake
 	root.AddCommand(&cobra.Command{
 		Use:   "wake",
-		Short: "Resume/start the VM now (holds it awake if the schedule wants it asleep)",
+		Short: "Resume/start the VM now (with a short keep-awake grace when idle shutdown is on)",
 		RunE:  appCmd(&cfgPath, func(ctx context.Context, a *cli.App, _ []string) error { return a.Wake(ctx) }),
 	})
 
-	// sleep (+ alias off)
+	// sleep [HH:MM] (+ alias off)
 	root.AddCommand(&cobra.Command{
-		Use:     "sleep",
+		Use:     "sleep [HH:MM]",
 		Aliases: []string{"off"},
-		Short:   "Suspend the VM now (holds it asleep if the schedule wants it awake)",
-		RunE:    appCmd(&cfgPath, func(ctx context.Context, a *cli.App, _ []string) error { return a.Sleep(ctx) }),
+		Short:   "Suspend now, or schedule a one-off suspend at HH:MM (or HHMM, configured timezone)",
+		Args:    cobra.MaximumNArgs(1),
+		RunE:    appCmd(&cfgPath, runSleep),
 	})
 
 	// ssh
@@ -121,22 +115,6 @@ func newRootCmd() *cobra.Command {
 		Use:   "herdr",
 		Short: "Wake if needed, wait for SSH, then open Herdr attached to the VM",
 		RunE:  runUpCmd,
-	})
-
-	// wake-at
-	root.AddCommand(&cobra.Command{
-		Use:   "wake-at HH:MM",
-		Short: "Set a one-workday override for the next wake transition",
-		Args:  cobra.ExactArgs(1),
-		RunE:  appCmd(&cfgPath, func(ctx context.Context, a *cli.App, args []string) error { return a.WakeAt(ctx, args[0]) }),
-	})
-
-	// sleep-at
-	root.AddCommand(&cobra.Command{
-		Use:   "sleep-at HH:MM",
-		Short: "Set a one-workday override for the current/next sleep transition",
-		Args:  cobra.ExactArgs(1),
-		RunE:  appCmd(&cfgPath, func(ctx context.Context, a *cli.App, args []string) error { return a.SleepAt(ctx, args[0]) }),
 	})
 
 	// forward
@@ -159,7 +137,7 @@ func newRootCmd() *cobra.Command {
 	// keep-awake
 	root.AddCommand(&cobra.Command{
 		Use:   "keep-awake DURATION",
-		Short: "Keep the VM awake for at least DURATION (e.g. 3h, 90m)",
+		Short: "Wake if needed, then keep the VM awake for at least DURATION (e.g. 3h, 90m)",
 		Args:  cobra.ExactArgs(1),
 		RunE: appCmd(&cfgPath, func(ctx context.Context, a *cli.App, args []string) error {
 			d, err := time.ParseDuration(args[0])
@@ -170,17 +148,37 @@ func newRootCmd() *cobra.Command {
 		}),
 	})
 
-	// cancel-override
+	// cancel
 	root.AddCommand(&cobra.Command{
-		Use:   "cancel-override",
-		Short: "Remove active one-workday overrides and manual holds",
-		RunE:  appCmd(&cfgPath, func(ctx context.Context, a *cli.App, _ []string) error { return a.CancelOverride(ctx) }),
+		Use:   "cancel",
+		Short: "Clear the scheduled sleep and keep-awake hold",
+		RunE:  appCmd(&cfgPath, func(ctx context.Context, a *cli.App, _ []string) error { return a.Cancel(ctx) }),
 	})
+
+	// The retired commands explain themselves rather than failing with a bare
+	// "unknown command" (or, for sleep-at, a suggestion that would suspend the
+	// VM immediately if followed literally).
+	for _, retired := range []struct{ use, msg string }{
+		{"wake-at", "wake-at was removed: waking is manual now (`workbox wake`); " +
+			"auto-suspend is paused during schedule.working_hours (if configured), " +
+			"and the VM otherwise suspends when idle"},
+		{"sleep-at", "sleep-at was replaced by `workbox sleep HH:MM` " +
+			"(bare `workbox sleep` suspends immediately)"},
+		{"cancel-override", "cancel-override was renamed to `workbox cancel`"},
+	} {
+		root.AddCommand(&cobra.Command{
+			Use:    retired.use,
+			Short:  retired.msg,
+			Hidden: true,
+			Args:   cobra.ArbitraryArgs,
+			RunE:   func(_ *cobra.Command, _ []string) error { return errors.New(retired.msg) },
+		})
+	}
 
 	// schedule
 	root.AddCommand(&cobra.Command{
 		Use:   "schedule",
-		Short: "Show the normal schedule, overrides, holds and next transitions",
+		Short: "Show working hours, idle shutdown, keep-awake hold and scheduled sleep",
 		RunE:  appCmd(&cfgPath, func(ctx context.Context, a *cli.App, _ []string) error { return a.Schedule(ctx) }),
 	})
 
@@ -200,6 +198,14 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(doctorCmd)
 
 	return root
+}
+
+// runSleep suspends now, or schedules a one-off suspend when given an HH:MM.
+func runSleep(ctx context.Context, a *cli.App, args []string) error {
+	if len(args) == 1 {
+		return a.SleepAt(ctx, args[0])
+	}
+	return a.Sleep(ctx)
 }
 
 // appCmd adapts an App method into a cobra RunE that wires config, compute and
@@ -252,11 +258,12 @@ func buildApp(ctx context.Context, cfg *config.Config) (*cli.App, func(), error)
 		return nil, nil, err
 	}
 	app := &cli.App{
-		Cfg:     cfg,
-		Sched:   sc,
-		Compute: comp,
-		Store:   store,
-		Out:     os.Stdout,
+		Cfg:      cfg,
+		Sched:    sc,
+		Compute:  comp,
+		Store:    store,
+		Activity: comp, // *compute.GCP reads the last-active guest attribute and lastStartTimestamp
+		Out:      os.Stdout,
 	}
 	cleanup := func() {
 		// Best-effort release of client connections on shutdown; a close error is
@@ -279,7 +286,8 @@ func sshTarget(cfg *config.Config) ssh.Target {
 	return ssh.Target{Host: cfg.Tailscale.SSHTarget, User: cfg.Machine.LinuxUser}
 }
 
-// wakeAndWait wakes the VM and waits for SSH.
+// wakeAndWait wakes the VM (see cli.App.Wake for the post-wake grace hold) and
+// waits for SSH.
 func wakeAndWait(ctx context.Context, cfg *config.Config) error {
 	const waitInterval = 3 * time.Second
 	connectTimeout := cfg.SSH.ConnectTimeout()
@@ -412,9 +420,19 @@ func runDoctor(ctx context.Context, cfgPath string, wake bool) error {
 		return doctor.ErrChecksFailed
 	}
 
+	// A failed wake is reported as a check rather than returned: the Cloud-API
+	// checks need no SSH, and "I woke it and something is wrong" is exactly when
+	// they are wanted. Ctrl-C still aborts.
+	var wakeResult []doctor.Result
 	if wake {
 		if err := wakeAndWait(ctx, cfg); err != nil {
-			return err
+			if ctx.Err() != nil {
+				return err
+			}
+			wakeResult = []doctor.Result{{
+				Name: "wake", Level: doctor.Fail, Detail: err.Error(),
+				Remedy: "see the diagnosis above; the checks below ran anyway",
+			}}
 		}
 	}
 
@@ -426,8 +444,9 @@ func runDoctor(ctx context.Context, cfgPath string, wake bool) error {
 	} else {
 		defer func() { _ = comp.Close() }() // best-effort; nothing actionable on failure
 		deps.Compute = comp
+		deps.Activity = comp
 	}
-	results := doctor.Run(ctx, deps)
+	results := append(wakeResult, doctor.Run(ctx, deps)...)
 	printResults(os.Stdout, results)
 	if doctor.Failed(results) {
 		return doctor.ErrChecksFailed

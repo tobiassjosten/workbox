@@ -1,17 +1,22 @@
 # workbox reconciler — runs once per minute (Cloud Scheduler -> Workflows).
 #
-# It is a small, idempotent reconciler:
-#   1. compute the local time in the configured IANA timezone (DST-safe)
-#   2. derive the baseline desired state from the normal schedule
-#   3. read operational overrides/holds from Firestore and apply them in order
-#      (baseline < wake_override < sleep_override < hold)
-#   4. inspect the instance
-#   5. perform ONLY the transition required
-#   6. clean up state once every override/hold has expired
+# It is a small, idempotent, SUSPEND-ONLY watchdog. Waking is always a manual
+# action (the CLI), so this reconciler never resumes or starts the VM; it only
+# decides whether a RUNNING VM should be suspended now:
+#   1. inspect the instance; do nothing unless it is RUNNING
+#   2. a one-off scheduled sleep (Firestore) forces a suspend, even in hours
+#   3. a keep-awake hold (Firestore) inhibits suspend
+#   4. within working hours, auto-suspend is disabled
+#   5. with idle_min = 0 idle shutdown is off, so leave it running; otherwise
+#      suspend once the VM has been idle for idle_min minutes, counted from the
+#      later of the guest-attributes activity signal the VM emits and the
+#      instance's lastStartTimestamp (a boot grace for every start path, not
+#      only `workbox wake`)
+#   6. clean up expired Firestore spans
 #
-# Terraform fills in its interpolations below; Workflows' own expressions use the
-# doubled-dollar form so templatefile leaves them intact. Switch conditions only
-# route with next: (to named steps) to stay within the documented syntax.
+# This mirrors internal/schedule.AutoSuspend. Terraform fills in its
+# interpolations; Workflows' own expressions use the doubled-dollar form. Switch
+# conditions only route with next: (to named steps) to stay within the syntax.
 
 main:
   steps:
@@ -20,30 +25,43 @@ main:
           - project: "${project}"
           - zone: "${zone}"
           - instance: "${instance}"
-          - wakeMin: ${wake_min}
-          - sleepMin: ${sleep_min}
+          - workStartMin: ${work_start_min}
+          - workEndMin: ${work_end_min}
+          - workDaysMap: ${work_days_map}
+          - idleMin: ${idle_min}
+          # A last-active value further in the future than this (VM clock drift)
+          # is ignored: anything on the VM can write the guest attribute, and a
+          # far-future value must not disable idle shutdown. Mirrors
+          # schedule.MaxActivitySkew.
+          - maxSkewS: 300
           - now: $${sys.now()}
           - localIso: $${time.format(now, "${timezone}")}
           - timePart: $${text.split(localIso, "T")[1]}
           - hm: $${text.split(timePart, ":")}
           - nowMin: $${int(hm[0]) * 60 + int(hm[1])}
 
-    # 2. Baseline desired state.
-    - baseline:
+    # 1. Inspect the instance. Only a RUNNING VM can be suspended; anything else
+    #    (suspended, terminated, transitional) is left alone — we never wake.
+    - getInstance:
+        call: googleapis.compute.v1.instances.get
+        args:
+          project: $${project}
+          zone: $${zone}
+          instance: $${instance}
+        result: inst
+    - status:
+        assign:
+          - vmStatus: $${inst.status}
+    - guardRunning:
         switch:
-          - condition: $${nowMin >= wakeMin and nowMin < sleepMin}
-            next: setAwake
-        next: setAsleep
-    - setAwake:
-        assign:
-          - desired: "awake"
-        next: readState
-    - setAsleep:
-        assign:
-          - desired: "asleep"
-        next: readState
+          - condition: $${vmStatus == "RUNNING"}
+            next: readState
+        next: notRunning
+    - notRunning:
+        return: "not-running"
 
-    # 3. Read overrides/holds (tolerate a missing document, abort on other errors).
+    # Read the scheduled sleep and keep-awake hold (tolerate a missing document,
+    # abort on other errors).
     - readState:
         try:
           call: googleapis.firestore.v1.projects.databases.documents.get
@@ -55,7 +73,7 @@ main:
           steps:
             - checkReadError:
                 switch:
-                  - condition: $${e.code == 404}
+                  - condition: $${"HttpError" in e.tags and e.code == 404}
                     next: noDoc
                 next: raise
             - raise:
@@ -68,41 +86,14 @@ main:
           - emptyFlds: {}
           - flds: $${default(map.get(doc, ["fields"]), emptyFlds)}
 
-    # Apply in precedence order: wake_override → sleep_override → hold (each overwrites desired).
-    - evalWake:
-        call: spanState
-        args:
-          fields: $${flds}
-          key: "wake_override"
-          now: $${now}
-        result: sWake
-    - useWake:
-        switch:
-          - condition: $${sWake != ""}
-            next: assignWake
-        next: evalSleep
-    - assignWake:
-        assign:
-          - desired: $${sWake}
-        next: evalSleep
-
+    # Gather the inputs for the precedence decision in steps 2-4 below.
     - evalSleep:
         call: spanState
         args:
           fields: $${flds}
-          key: "sleep_override"
+          key: "scheduled_sleep"
           now: $${now}
         result: sSleep
-    - useSleep:
-        switch:
-          - condition: $${sSleep != ""}
-            next: assignSleep
-        next: evalHold
-    - assignSleep:
-        assign:
-          - desired: $${sSleep}
-        next: evalHold
-
     - evalHold:
         call: spanState
         args:
@@ -110,55 +101,186 @@ main:
           key: "hold"
           now: $${now}
         result: sHold
-    - useHold:
-        switch:
-          - condition: $${sHold != ""}
-            next: assignHold
-        next: getInstance
-    - assignHold:
+    # Local weekday (0=Sun..6=Sat) from the local calendar date, so working hours
+    # can be limited to certain days. localIso is already in the configured
+    # timezone; parsing its date part at midnight UTC gives an exact multiple of
+    # 86400, so the division is exact whatever int() does with fractions.
+    # 1970-01-01 was a Thursday (Go time.Weekday 4).
+    - weekdayInit:
         assign:
-          - desired: $${sHold}
-        next: getInstance
-
-    # 4. Inspect the instance.
-    - getInstance:
-        call: googleapis.compute.v1.instances.get
-        args:
-          project: $${project}
-          zone: $${zone}
-          instance: $${instance}
-        result: inst
-    - status:
+          - datePart: $${text.split(localIso, "T")[0]}
+          - daySecs: $${time.parse(datePart + "T00:00:00Z")}
+          - weekday: $${(int(daySecs / 86400) + 4) % 7}
+          - isActiveDay: $${default(map.get(workDaysMap, [string(weekday)]), false)}
+    - withinHours:
         assign:
-          - vmStatus: $${inst.status}
+          - within: $${workStartMin >= 0 and isActiveDay and nowMin >= workStartMin and nowMin < workEndMin}
 
-    # 5. Perform only the transition required. Transitional states no-op and
-    #    settle on a later tick.
-    - reconcile:
+    # Each branch below assigns `action`, the value this execution returns so the
+    # history explains the tick: the matching schedule.Reason* value
+    # ("scheduled-sleep", "keep-awake", "working-hours", "idle-disabled",
+    # "active", "boot-grace", "no-activity", "idle"). A non-RUNNING VM returns
+    # "not-running" from the guardRunning miss path instead.
+    - decideScheduled:
+        # A one-off scheduled sleep forces a suspend even within working hours.
         switch:
-          - condition: $${desired == "awake" and vmStatus == "SUSPENDED"}
-            next: resumeVm
-          - condition: $${desired == "awake" and vmStatus == "TERMINATED"}
-            next: startVm
-          - condition: $${desired == "asleep" and vmStatus == "RUNNING"}
-            next: suspendVm
+          - condition: $${sSleep == "asleep"}
+            next: markScheduledSleep
+        next: decideProtected
+    - decideProtected:
+        # Keep-awake hold, working hours, or disabled idle shutdown: leave running.
+        switch:
+          - condition: $${sHold == "awake"}
+            next: keptKeepAwake
+          - condition: $${within}
+            next: keptWorkingHours
+          - condition: $${idleMin == 0}
+            next: keptIdleDisabled
+        next: readActivity
+    - keptKeepAwake:
+        assign:
+          - action: "keep-awake"
         next: cleanup
-    - resumeVm:
-        call: googleapis.compute.v1.instances.resume
-        args:
-          project: $${project}
-          zone: $${zone}
-          instance: $${instance}
-        result: op
-        next: waitVmOp
-    - startVm:
-        call: googleapis.compute.v1.instances.start
-        args:
-          project: $${project}
-          zone: $${zone}
-          instance: $${instance}
-        result: op
-        next: waitVmOp
+    - keptWorkingHours:
+        assign:
+          - action: "working-hours"
+        next: cleanup
+    - keptIdleDisabled:
+        assign:
+          - action: "idle-disabled"
+        next: cleanup
+
+    # 5. Idle shutdown: read the last-active guest attribute the VM emits.
+    - readActivity:
+        try:
+          call: googleapis.compute.v1.instances.getGuestAttributes
+          args:
+            project: $${project}
+            zone: $${zone}
+            instance: $${instance}
+            queryPath: "${activity_key}"
+          result: ga
+        except:
+          as: e
+          steps:
+            # A missing attribute (404) means "no activity known". Any other
+            # error (403, 429, 5xx) aborts this tick rather than suspending a VM
+            # whose activity we simply could not read; the next minute retries.
+            - checkActivityError:
+                switch:
+                  - condition: $${"HttpError" in e.tags and e.code == 404}
+                    next: noActivity
+                next: raiseActivity
+            - raiseActivity:
+                raise: $${e}
+            - noActivity:
+                assign:
+                  - ga: {}
+    # A queryPath lookup returns the value under queryValue.items (not
+    # variableValue). The entry is matched by key, as
+    # internal/compute.lastActiveFromResp does (the contract partner), so a
+    # foreign entry can never be read as the activity value. Unix seconds; 0
+    # below means "unknown".
+    - idleInputs:
+        assign:
+          - gaItems: $${default(map.get(ga, ["queryValue", "items"]), [])}
+          - lastActiveS: 0
+          - rawActive: ""
+          - startedStr: $${default(map.get(inst, ["lastStartTimestamp"]), "")}
+          - startedS: 0
+    - activityScan:
+        for:
+          value: item
+          in: $${gaItems}
+          steps:
+            - matchKey:
+                switch:
+                  - condition: $${default(map.get(item, ["key"]), "") == "${activity_key_name}"}
+                    next: takeValue
+                next: continue
+            - takeValue:
+                assign:
+                  - rawActive: $${default(map.get(item, ["value"]), "")}
+    - activityHave:
+        switch:
+          - condition: $${rawActive != ""}
+            next: activityParse
+        next: startedPick
+    # A value that is not a number (written by something other than the
+    # emitter) is treated as unknown rather than failing every tick.
+    - activityParse:
+        try:
+          steps:
+            - activityInt:
+                assign:
+                  - lastActiveS: $${int(rawActive)}
+        except:
+          as: e
+          steps:
+            - activityBad:
+                assign:
+                  - lastActiveS: 0
+    - activityClamp:
+        switch:
+          - condition: $${lastActiveS > now + maxSkewS}
+            next: activityFuture
+        next: startedPick
+    - activityFuture:
+        assign:
+          - lastActiveS: 0
+    - startedPick:
+        switch:
+          - condition: $${startedStr != ""}
+            next: startedParse
+        next: decideIdle
+    # Guarded like activityParse: a timestamp Workflows cannot parse must not
+    # kill every tick (which would stop idle shutdown silently); unknown lands
+    # on the fail-safe branch decideIdle already handles.
+    - startedParse:
+        try:
+          steps:
+            - startedTime:
+                assign:
+                  - startedS: $${time.parse(startedStr)}
+        except:
+          as: e
+          steps:
+            - startedBad:
+                assign:
+                  - startedS: 0
+    # Mirrors the idle half of schedule.AutoSuspend step for step. With neither
+    # value known it fails safe toward suspend; a fresh boot is covered by
+    # lastStartTimestamp, and the CLI's post-wake grace hold covers a resume.
+    - decideIdle:
+        switch:
+          - condition: $${lastActiveS != 0 and now - lastActiveS < idleMin * 60}
+            next: keptActive
+          - condition: $${startedS != 0 and now - startedS < idleMin * 60}
+            next: keptBootGrace
+          - condition: $${lastActiveS == 0}
+            next: markNoActivity
+        next: markIdle
+    - keptBootGrace:
+        assign:
+          - action: "boot-grace"
+        next: cleanup
+    - keptActive:
+        assign:
+          - action: "active"
+        next: cleanup
+
+    - markScheduledSleep:
+        assign:
+          - action: "scheduled-sleep"
+        next: suspendVm
+    - markNoActivity:
+        assign:
+          - action: "no-activity"
+        next: suspendVm
+    - markIdle:
+        assign:
+          - action: "idle"
+        next: suspendVm
     - suspendVm:
         call: googleapis.compute.v1.instances.suspend
         args:
@@ -180,18 +302,11 @@ main:
     #    (stale spans are inert once past their end).
     - cleanup:
         steps:
-          - keepWake:
-              call: spanKeep
-              args:
-                fields: $${flds}
-                key: "wake_override"
-                now: $${now}
-              result: kWake
           - keepSleep:
               call: spanKeep
               args:
                 fields: $${flds}
-                key: "sleep_override"
+                key: "scheduled_sleep"
                 now: $${now}
               result: kSleep
           - keepHold:
@@ -203,26 +318,46 @@ main:
               result: kHold
           - tally:
               assign:
-                - present: $${kWake.present + kSleep.present + kHold.present}
-                - keep: $${kWake.keep + kSleep.keep + kHold.keep}
+                - present: $${kSleep.present + kHold.present}
+                - keep: $${kSleep.keep + kHold.keep}
           - maybeDelete:
               switch:
                 - condition: $${present > 0 and keep == 0}
                   next: deleteDoc
               next: done
+          # Conditional on the snapshot read above: if the CLI wrote a new span
+          # meanwhile (e.g. a wake grace during the suspend wait), the delete
+          # fails its precondition, the except swallows it, and the new span
+          # survives until a later tick.
           - deleteDoc:
               try:
                 call: googleapis.firestore.v1.projects.databases.documents.delete
                 args:
                   name: $${"projects/" + project + "/databases/${database}/documents/${collection}/${document}"}
+                  currentDocument:
+                    updateTime: $${doc.updateTime}
+              # Two outcomes are benign: the precondition failed (400) because
+              # the CLI wrote meanwhile, or the document is already gone (404)
+              # because the CLI deleted it (`cancel`/`sleep`/`wake` clear it).
+              # Any other error (missing datastore.user, 5xx, a bad argument)
+              # fails the execution so it shows up in the workflow history
+              # instead of silently leaving the document uncollected.
               except:
+                as: e
                 steps:
+                  - classify:
+                      switch:
+                        - condition: $${"HttpError" in e.tags and (e.code == 400 or e.code == 404)}
+                          next: ignore
+                      next: rethrow
+                  - rethrow:
+                      raise: $${e}
                   - ignore:
                       assign:
                         - ignored: true
               next: done
           - done:
-              return: $${desired}
+              return: $${action}
 
 # spanState and spanKeep below both decode a span from the same Firestore wire
 # shape — map.get(fields, [key, "mapValue", "fields"]) then the start/end

@@ -3,6 +3,9 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/tobiassjosten/workbox/internal/compute"
@@ -28,28 +31,55 @@ func spanJSON(s *schedule.Span) *SpanJSON {
 	}
 }
 
-// TransitionJSON is the stable JSON form of the next transition.
-type TransitionJSON struct {
-	At string `json:"at"`
-	To string `json:"to"`
+// WorkingHoursJSON reports the working-hours window. It is always present;
+// Enabled is false (and the rest zero) when no window is configured or the
+// window is disabled (`enabled: false`), and an absent days list means the
+// window applies every day.
+type WorkingHoursJSON struct {
+	Enabled bool     `json:"enabled"`
+	Start   string   `json:"start,omitempty"`
+	End     string   `json:"end,omitempty"`
+	Days    []string `json:"days,omitempty"`
+	Within  bool     `json:"within"`
+}
+
+// ActivityJSON reports the last-active readout when known. IdleSeconds measures
+// from LastActive alone; auto-suspend counts idle from the later of LastActive
+// and StatusJSON.LastStart, so during boot grace the two differ.
+type ActivityJSON struct {
+	LastActive  string `json:"last_active"`
+	IdleSeconds int64  `json:"idle_seconds"`
 }
 
 // StatusJSON is the stable machine-readable status document.
 type StatusJSON struct {
 	Name     string `json:"name"`
 	VM       string `json:"vm"`
-	Desired  string `json:"desired"`
 	Schedule struct {
-		Wake     string `json:"wake"`
-		Sleep    string `json:"sleep"`
-		Timezone string `json:"timezone"`
+		Timezone           string           `json:"timezone"`
+		WorkingHours       WorkingHoursJSON `json:"working_hours"`
+		IdleTimeoutMinutes int              `json:"idle_timeout_minutes"`
 	} `json:"schedule"`
-	NextTransition *TransitionJSON `json:"next_transition,omitempty"`
-	NextWake       string          `json:"next_wake,omitempty"`
-	NextSleep      string          `json:"next_sleep,omitempty"`
-	WakeOverride   *SpanJSON       `json:"wake_override,omitempty"`
-	SleepOverride  *SpanJSON       `json:"sleep_override,omitempty"`
-	Hold           *SpanJSON       `json:"hold,omitempty"`
+	AutoSuspend struct {
+		// Suspend is meaningful only when Reason is one of the schedule.Reason*
+		// values: for ReasonNotRunning and ReasonActivityUnknown the verdict is
+		// unknown, not "no", so consumers must branch on Reason first.
+		Suspend bool   `json:"suspend"`
+		Reason  string `json:"reason"`
+	} `json:"auto_suspend"`
+	Activity *ActivityJSON `json:"activity,omitempty"`
+	// ActivityIgnored explains a last-active value `workbox status` read but
+	// disregarded: not a usable timestamp, or too far in the future.
+	ActivityIgnored string `json:"activity_ignored,omitempty"`
+	// ActivityError and LastStartError report a failed read, so a consumer can
+	// tell "could not read" from "nothing reported".
+	ActivityError string `json:"activity_error,omitempty"`
+	// LastStart is the instance's last start while it is running; idle shutdown
+	// counts from the later of it and activity.last_active.
+	LastStart      string    `json:"last_start,omitempty"`
+	LastStartError string    `json:"last_start_error,omitempty"`
+	KeepAwake      *SpanJSON `json:"keep_awake,omitempty"`
+	ScheduledSleep *SpanJSON `json:"scheduled_sleep,omitempty"`
 	SSH            struct {
 		Target    string `json:"target"`
 		Available bool   `json:"available"`
@@ -57,83 +87,180 @@ type StatusJSON struct {
 	} `json:"ssh"`
 }
 
-// collectStatus gathers the current status without any external SSH probing. The
-// returned time.Time is the next-transition instant (zero if none); PrintStatus
-// uses it to format the transition in the schedule timezone without re-parsing
-// the RFC3339 string stored in StatusJSON.
-func (a *App) collectStatus(ctx context.Context) (s StatusJSON, doc *state.Document, nextAt time.Time, err error) {
+// Status-only auto-suspend reasons, for when the CLI cannot reproduce the
+// reconciler's verdict. The reconciler itself only acts on a RUNNING VM. With
+// the schedule.Reason* constants these are the complete set of values
+// StatusJSON.AutoSuspend.Reason can take.
+const (
+	ReasonNotRunning      = "not-running"
+	ReasonActivityUnknown = "activity-unknown"
+)
+
+// statusData is everything collectStatus gathers for the two renderers.
+type statusData struct {
+	Now         time.Time
+	VM          compute.State
+	JSON        StatusJSON
+	Doc         *state.Document
+	LastActive  time.Time
+	HaveActive  bool
+	LastStart   time.Time
+	ActivityErr error
+	// Ignored explains a read value the verdict disregards (the reconciler never
+	// counts it as recent activity either); empty when none was ignored.
+	Ignored  string
+	StartErr error
+}
+
+// collectStatus gathers the current status without any external SSH probing.
+func (a *App) collectStatus(ctx context.Context) (statusData, error) {
 	now := a.now()
+	d := statusData{Now: now}
 
 	vm, err := a.Compute.Status(ctx)
 	if err != nil {
-		return s, nil, time.Time{}, err
+		return d, err
 	}
+	d.VM = vm
 
-	doc, err = a.activeDoc(ctx, now)
+	d.Doc, err = a.activeDoc(ctx, now)
 	if err != nil {
-		return s, nil, time.Time{}, err
+		return d, err
 	}
-	ov := doc.Overrides()
 
+	// Activity is only meaningful while the VM is running. A read failure is
+	// reported rather than mistaken for "no activity".
+	if a.Activity != nil && vm == compute.Running {
+		// The two reads are independent: an unreadable activity value still
+		// leaves the boot grace to decide here, whereas the reconciler aborts
+		// the tick on a non-404 read error and retries the next minute.
+		d.LastActive, d.HaveActive, d.ActivityErr = a.Activity.LastActive(ctx)
+		switch {
+		case errors.Is(d.ActivityErr, compute.ErrInvalidActivity):
+			// Drop the value so the verdict counts no activity; the reconciler
+			// never counts such a value as recent activity either.
+			d.Ignored, d.ActivityErr = "not a usable unix timestamp", nil
+		case d.ActivityErr == nil && d.HaveActive && schedule.FutureActivity(d.LastActive, now):
+			d.Ignored = "last active " + a.fmtTime(d.LastActive) + " is in the future"
+		}
+		if d.ActivityErr != nil || d.Ignored != "" {
+			d.LastActive, d.HaveActive = time.Time{}, false
+		}
+		d.LastStart, _, d.StartErr = a.Activity.LastStart(ctx)
+	}
+
+	idle := a.Cfg.Schedule.IdleTimeout()
+	s := &d.JSON
 	s.Name = a.Cfg.Name
 	s.VM = vm.String()
-	s.Desired = string(a.Sched.Desired(now, ov))
-	s.Schedule.Wake = a.Cfg.Schedule.Wake
-	s.Schedule.Sleep = a.Cfg.Schedule.Sleep
 	s.Schedule.Timezone = a.Cfg.Schedule.Timezone
-
-	if tr, ok := a.Sched.NextTransition(now, ov); ok {
-		nextAt = tr.At
-		s.NextTransition = &TransitionJSON{At: tr.At.Format(time.RFC3339), To: string(tr.To)}
+	s.Schedule.IdleTimeoutMinutes = int(idle / time.Minute)
+	if a.Sched.Enabled {
+		s.Schedule.WorkingHours = WorkingHoursJSON{
+			Enabled: true,
+			Start:   a.Sched.Start.String(),
+			End:     a.Sched.End.String(),
+			Days:    shortDays(a.Sched.Days),
+			Within:  a.Sched.WithinWorkingHours(now),
+		}
 	}
-	if nw, ok := a.Sched.NextWake(now, ov); ok {
-		s.NextWake = nw.Format(time.RFC3339)
+	if vm != compute.Running {
+		s.AutoSuspend.Reason = ReasonNotRunning
+	} else {
+		act := schedule.Activity{LastActive: d.LastActive, LastStart: d.LastStart}
+		dec := a.Sched.AutoSuspend(now, d.Doc.Spans(), act, idle)
+		activityUnread := a.Activity == nil || d.ActivityErr != nil
+		suspendsOnIdle := dec.Reason == schedule.ReasonNoActivity || dec.Reason == schedule.ReasonIdle
+		if (activityUnread && dec.Reason == schedule.ReasonNoActivity) || (d.StartErr != nil && suspendsOnIdle) {
+			// The verdict hinged on a value we could not (or do not) read: the
+			// activity, or the start time that could have meant boot grace.
+			s.AutoSuspend.Reason = ReasonActivityUnknown
+		} else {
+			s.AutoSuspend.Suspend = dec.Suspend
+			s.AutoSuspend.Reason = dec.Reason
+		}
 	}
-	if ns, ok := a.Sched.NextSleep(now, ov); ok {
-		s.NextSleep = ns.Format(time.RFC3339)
+	if d.HaveActive {
+		s.Activity = &ActivityJSON{
+			LastActive:  d.LastActive.Format(time.RFC3339),
+			IdleSeconds: int64(idleFor(now, d.LastActive) / time.Second),
+		}
 	}
-	s.WakeOverride = spanJSON(doc.Wake)
-	s.SleepOverride = spanJSON(doc.Sleep)
-	s.Hold = spanJSON(doc.Hold)
+	s.ActivityIgnored = d.Ignored
+	if d.ActivityErr != nil {
+		s.ActivityError = d.ActivityErr.Error()
+	}
+	if d.StartErr != nil {
+		s.LastStartError = d.StartErr.Error()
+	}
+	if !d.LastStart.IsZero() {
+		s.LastStart = d.LastStart.Format(time.RFC3339)
+	}
+	s.KeepAwake = spanJSON(d.Doc.Hold)
+	s.ScheduledSleep = spanJSON(d.Doc.Sleep)
 
 	s.SSH.Target = a.Cfg.Tailscale.SSHTarget
-	// SSH is only usable once the VM is fully RUNNING; transitional states don't count.
 	s.SSH.Available = vm == compute.Running
 	if !s.SSH.Available {
 		s.SSH.Reason = "VM is " + s.VM
 	}
-	return s, doc, nextAt, nil
+	return d, nil
 }
 
 // PrintStatusJSON prints the machine-readable status.
 func (a *App) PrintStatusJSON(ctx context.Context) error {
-	s, _, _, err := a.collectStatus(ctx)
+	d, err := a.collectStatus(ctx)
 	if err != nil {
 		return err
 	}
 	enc := json.NewEncoder(a.Out)
 	enc.SetIndent("", "  ")
-	return enc.Encode(s)
+	return enc.Encode(d.JSON)
 }
 
 // PrintStatus prints the human-readable status.
 func (a *App) PrintStatus(ctx context.Context) error {
-	s, doc, nextAt, err := a.collectStatus(ctx)
+	d, err := a.collectStatus(ctx)
 	if err != nil {
 		return err
 	}
+	s, doc, now := d.JSON, d.Doc, d.Now
+
 	a.printf("VM:              %s\n", s.VM)
-	a.printf("Desired:         %s\n", s.Desired)
-	a.printf("Schedule:        %s–%s %s\n", s.Schedule.Wake, s.Schedule.Sleep, s.Schedule.Timezone)
-	if s.NextTransition != nil {
-		verb := "resume"
-		if s.NextTransition.To == string(schedule.Asleep) {
-			verb = "suspend"
-		}
-		a.printf("Next transition: %s at %s\n", verb, a.fmtTime(nextAt))
+	a.printWorkingHours(now)
+	a.printIdle()
+	switch {
+	case d.ActivityErr != nil:
+		a.printf("Activity:        unavailable (%v); run `workbox doctor`\n", d.ActivityErr)
+	case d.Ignored != "":
+		a.printf("Activity:        ignored (%s); run `workbox doctor`\n", d.Ignored)
+	case d.HaveActive:
+		a.printf("Activity:        last active %s (idle %s)\n",
+			a.fmtTime(d.LastActive), humanDuration(idleFor(now, d.LastActive)))
+	case a.Activity != nil && d.VM == compute.Running:
+		// Running with no value: the startup script reports one at every boot, so
+		// provisioning has not run since the upgrade that added that report, or
+		// the report failed (see doctor).
+		a.printf("Activity:        none reported; run `workbox doctor` if this persists\n")
 	}
-	a.printf("Override:        %s\n", a.describeOverrides(doc))
-	a.printf("Hold:            %s\n", a.describeHold(doc))
+	if d.StartErr != nil {
+		a.printf("Last start:      unavailable (%v); retry, and run `workbox doctor` if it persists\n", d.StartErr)
+	}
+	verdict := describeDecision(s.AutoSuspend.Suspend, s.AutoSuspend.Reason, s.VM)
+	if r := s.AutoSuspend.Reason; r == schedule.ReasonActive || r == schedule.ReasonBootGrace {
+		// Idle counts from the later of the two, as in schedule.AutoSuspend.
+		ref := d.LastActive
+		if d.LastStart.After(ref) {
+			ref = d.LastStart
+		}
+		// Working hours would inhibit a suspend due inside the window, so only
+		// name a time the reconciler could actually act on.
+		if earliest := ref.Add(a.Cfg.Schedule.IdleTimeout()); !a.Sched.WithinWorkingHours(earliest) {
+			verdict += fmt.Sprintf(" (earliest idle suspend %s)", a.fmtTime(earliest))
+		}
+	}
+	a.printf("Auto-suspend:    %s\n", verdict)
+	a.printHoldAndSleep(doc, now, withoutNone)
 	if s.SSH.Available {
 		a.printf("Tailscale/SSH:   target %s (VM running)\n", s.SSH.Target)
 	} else {
@@ -142,72 +269,185 @@ func (a *App) PrintStatus(ctx context.Context) error {
 	return nil
 }
 
-func (a *App) describeOverrides(doc *state.Document) string {
+// withNone/withoutNone select whether printHoldAndSleep prints an explicit
+// "none" line for an absent hold or scheduled sleep.
+const (
+	withNone    = true
+	withoutNone = false
+)
+
+// printHoldAndSleep renders the keep-awake hold and scheduled sleep. showNone
+// prints an explicit "none" for each (the `schedule` view); status omits them.
+func (a *App) printHoldAndSleep(doc *state.Document, now time.Time, showNone bool) {
 	switch {
-	case doc.Wake != nil && doc.Sleep != nil:
-		return "wake " + a.fmtTime(wakeEdge(doc.Wake)) + "; sleep " + a.fmtTime(sleepEdge(doc.Sleep))
-	case doc.Wake != nil:
-		return "wake " + a.fmtTime(wakeEdge(doc.Wake))
+	case doc.Hold != nil:
+		a.printf("Keep-awake:      until %s\n", a.fmtTime(doc.Hold.End))
+	case showNone:
+		a.printf("Keep-awake:      none\n")
+	}
+	switch {
 	case doc.Sleep != nil:
-		return "sleep " + a.fmtTime(sleepEdge(doc.Sleep))
+		a.printf("Scheduled sleep: %s\n", a.describeSleep(doc.Sleep, now))
+	case showNone:
+		a.printf("Scheduled sleep: none\n")
+	}
+}
+
+// describeSleep renders a scheduled sleep: its start while pending, and its
+// span once in effect (the start alone would read as a time in the past).
+func (a *App) describeSleep(sp *schedule.Span, now time.Time) string {
+	if sp.Active(now) {
+		return fmt.Sprintf("in effect since %s until %s", a.fmtTime(sp.Start), a.fmtTime(sp.End))
+	}
+	return "at " + a.fmtTime(sp.Start)
+}
+
+func (a *App) printWorkingHours(now time.Time) {
+	idleOn := a.Cfg.Schedule.IdleTimeout() > 0
+	if !a.Sched.Enabled {
+		label := "none"
+		if a.Cfg.Schedule.WorkingHours != nil {
+			label = "disabled in config"
+		}
+		// Name the timezone here too: `sleep HH:MM` resolves against it.
+		if idleOn {
+			a.printf("Working hours:   %s (times in %s; idle shutdown always applies)\n", label, a.Cfg.Schedule.Timezone)
+		} else {
+			a.printf("Working hours:   %s (times in %s)\n", label, a.Cfg.Schedule.Timezone)
+		}
+		return
+	}
+	within := a.Sched.WithinWorkingHours(now)
+	phase := "outside — idle shutdown active"
+	switch {
+	case !idleOn && within:
+		phase = "within — idle shutdown disabled"
+	case !idleOn:
+		phase = "outside — idle shutdown disabled"
+	case within:
+		phase = "within — idle shutdown paused"
+	}
+	a.printf("Working hours:   %s–%s %s %s (%s)\n",
+		a.Sched.Start, a.Sched.End, daysLabel(a.Sched.Days), a.Cfg.Schedule.Timezone, phase)
+}
+
+// daysLabel renders the active weekdays for humans.
+func daysLabel(days []time.Weekday) string {
+	set := weekdaySet(days)
+	if len(set) == 0 || len(set) == 7 {
+		return "every day"
+	}
+	weekdaysOnly := len(set) == 5 && set[time.Monday] && set[time.Tuesday] &&
+		set[time.Wednesday] && set[time.Thursday] && set[time.Friday]
+	if weekdaysOnly {
+		return "Mon–Fri"
+	}
+	if len(set) == 2 && set[time.Saturday] && set[time.Sunday] {
+		return "Sat–Sun"
+	}
+	return strings.Join(shortDaysFromSet(set), ", ")
+}
+
+// shortDays renders weekdays as 3-letter names in calendar order (Sun–Sat).
+func shortDays(days []time.Weekday) []string {
+	return shortDaysFromSet(weekdaySet(days))
+}
+
+// shortDaysFromSet is shortDays for callers that already built the set.
+func shortDaysFromSet(set map[time.Weekday]bool) []string {
+	var out []string
+	for wd := time.Sunday; wd <= time.Saturday; wd++ {
+		if set[wd] {
+			out = append(out, wd.String()[:3])
+		}
+	}
+	return out
+}
+
+// weekdaySet returns the distinct weekdays in days.
+func weekdaySet(days []time.Weekday) map[time.Weekday]bool {
+	set := make(map[time.Weekday]bool, len(days))
+	for _, d := range days {
+		set[d] = true
+	}
+	return set
+}
+
+func (a *App) printIdle() {
+	idle := a.Cfg.Schedule.IdleTimeout()
+	switch {
+	case idle <= 0:
+		a.printf("Idle shutdown:   disabled\n")
+	case a.Sched.Enabled:
+		a.printf("Idle shutdown:   after %s of inactivity (outside working hours)\n", humanDuration(idle))
 	default:
-		return "none"
+		a.printf("Idle shutdown:   after %s of inactivity\n", humanDuration(idle))
 	}
 }
 
-// wakeEdge returns the user-meaningful transition edge of a wake override span.
-// For early-wake (Awake) spans the requested wake time is Start; for delayed-wake
-// (Asleep) spans it is End.
-func wakeEdge(s *schedule.Span) time.Time {
-	if s == nil {
-		return time.Time{}
+// describeDecision renders the auto-suspend verdict for humans.
+func describeDecision(suspend bool, reason, vm string) string {
+	switch reason {
+	case ReasonNotRunning:
+		return "n/a — VM is " + vm
+	case ReasonActivityUnknown:
+		return "unknown — activity or start time could not be read"
+	case schedule.ReasonScheduledSleep:
+		return "yes — a scheduled sleep is due"
+	case schedule.ReasonKeepAwake:
+		return "no — held awake"
+	case schedule.ReasonWorkingHours:
+		return "no — within working hours"
+	case schedule.ReasonIdleDisabled:
+		return "no — idle shutdown disabled"
+	case schedule.ReasonActive:
+		return "no — recently active"
+	case schedule.ReasonBootGrace:
+		return "no — recently started"
+	case schedule.ReasonIdle:
+		return "yes — idle past the timeout"
+	case schedule.ReasonNoActivity:
+		return "yes — no activity reported"
+	default:
+		if suspend {
+			return "yes"
+		}
+		return "no"
 	}
-	if s.State == schedule.Awake {
-		return s.Start
-	}
-	return s.End
 }
 
-// sleepEdge returns the user-meaningful transition edge of a sleep override span.
-// For extend-awake (Awake) spans the requested sleep time is End; for early-sleep
-// (Asleep) spans it is Start.
-func sleepEdge(s *schedule.Span) time.Time {
-	if s == nil {
-		return time.Time{}
-	}
-	if s.State == schedule.Awake {
-		return s.End
-	}
-	return s.Start
+// idleFor is how long the VM has been idle, clamped at zero so clock skew
+// between the VM and this machine never reads as a negative idle time.
+func idleFor(now, lastActive time.Time) time.Duration {
+	return max(now.Sub(lastActive), 0)
 }
 
-func (a *App) describeHold(doc *state.Document) string {
-	if doc.Hold == nil {
-		return "none"
+// humanDuration renders a duration as a compact "1h2m" / "2h" / "45m" string.
+func humanDuration(d time.Duration) string {
+	d = d.Round(time.Minute)
+	h := int(d / time.Hour)
+	m := int((d % time.Hour) / time.Minute)
+	if h > 0 && m == 0 {
+		return fmt.Sprintf("%dh", h)
 	}
-	return "stay " + string(doc.Hold.State) + " until " + a.fmtTime(doc.Hold.End)
+	if h > 0 {
+		return fmt.Sprintf("%dh%dm", h, m)
+	}
+	return fmt.Sprintf("%dm", m)
 }
 
-// Schedule prints the normal schedule, overrides, holds and next transitions.
-// It only reads the state document and computes transitions — it does not call
-// the Compute API, so it works even when the VM is unreachable.
+// Schedule prints the working-hours window, idle-shutdown setting, active
+// keep-awake hold and scheduled sleep. It reads only the state document and
+// config, so it works even when the VM is unreachable.
 func (a *App) Schedule(ctx context.Context) error {
 	now := a.now()
 	doc, err := a.activeDoc(ctx, now)
 	if err != nil {
 		return err
 	}
-	ov := doc.Overrides()
-	a.printf("Normal schedule: wake %s, sleep %s (%s)\n",
-		a.Cfg.Schedule.Wake, a.Cfg.Schedule.Sleep, a.Cfg.Schedule.Timezone)
-	a.printf("Override:        %s\n", a.describeOverrides(doc))
-	a.printf("Hold:            %s\n", a.describeHold(doc))
-	if nw, ok := a.Sched.NextWake(now, ov); ok {
-		a.printf("Next wake:       %s\n", a.fmtTime(nw))
-	}
-	if ns, ok := a.Sched.NextSleep(now, ov); ok {
-		a.printf("Next sleep:      %s\n", a.fmtTime(ns))
-	}
-	a.printf("\nTo permanently change the schedule, edit schedule.wake/schedule.sleep in\nyour config and re-run `make tf-apply`.\n")
+	a.printWorkingHours(now)
+	a.printIdle()
+	a.printHoldAndSleep(doc, now, withNone)
+	a.printf("\nWake is manual (`workbox` / `workbox wake`). To change working hours or\nthe idle timeout, edit the schedule block in your config and re-run\n`make tf-apply`.\n")
 	return nil
 }

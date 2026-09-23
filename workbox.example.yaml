@@ -69,12 +69,41 @@ tailscale:
   manage_policy: false
 
 schedule:
-  # IANA timezone. DST is handled automatically; do not use fixed UTC offsets.
+  # IANA timezone, used for working hours and the VM clock. DST is handled
+  # automatically; do not use fixed UTC offsets.
   timezone: Europe/Stockholm
-  # Baseline wake and sleep, local time, HH:MM. wake must be earlier than sleep.
-  wake: "06:00"
-  sleep: "23:00"
 
+  # The VM is always woken MANUALLY (`workbox` / `workbox wake`). It suspends
+  # itself on its own once nothing is happening. Two independent, optional
+  # controls govern that:
+
+  # Working hours: an optional recurring window (local time, HH:MM, start earlier
+  # than end) during which automatic suspend is DISABLED. Outside it, idle
+  # shutdown applies. Omit the block, or set enabled:false, to have idle shutdown
+  # apply around the clock.
+  working_hours:
+    start: "06:00"
+    end: "23:00"
+    # days: [mon, tue, wed, thu, fri]   # restrict to weekdays; omit = every day
+    # enabled: false                    # keep the window configured but inactive
+
+  # Idle shutdown: outside working hours, suspend after this many minutes with no
+  # activity — no herdr agent working and no open inbound SSH connection (a
+  # `workbox forward` tunnel or an attached Herdr client counts). Idle time
+  # counts from the later of the last activity and the VM's last boot. A
+  # long-running command that is not a Herdr agent (a build, `nohup`) does not
+  # count; run `workbox keep-awake 2h` before walking away from one. Defaults to
+  # 30; minimum 5. Set 0 to disable idle shutdown entirely (only
+  # manual/scheduled sleep).
+  idle_timeout_minutes: 30
+
+# Connectivity probe tuning for every command that waits for SSH after a wake
+# (`workbox`, `ssh`, `herdr`, `forward`, `doctor --wake`) and for `workbox
+# doctor` itself, whose probes always use the connect timeout.
+# Optional; the defaults suit a healthy VM. Raise them if a loaded machine is
+# slow to complete the SSH handshake, which otherwise shows up as "Waiting for
+# SSH..." timing out after wait_timeout_seconds. Consumed only by the CLI (not
+# Terraform).
 ssh:
   # Per-probe SSH connect timeout in seconds. Default 15.
   connect_timeout_seconds: 15

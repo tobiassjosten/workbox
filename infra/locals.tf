@@ -1,5 +1,6 @@
 # Decode the shared config once and normalize it into locals. Defaults here must
-# mirror internal/config/config.go Defaults() so the CLI and Terraform agree.
+# mirror internal/config's defaults (Defaults(), defaultIdleTimeoutMinutes, ...)
+# so the CLI and Terraform agree; values Terraform owns alone are marked inline.
 #
 # For any value the CLI also consumes, use coalesce(try(local.cfg.X, ""),
 # <default>) rather than bare try(): Defaults() normalizes an empty string — not
@@ -54,12 +55,60 @@ locals {
   ssh_target = coalesce(try(local.cfg.tailscale.ssh_target, ""), local.ts_hostname)
 
   timezone = local.cfg.schedule.timezone
-  wake     = local.cfg.schedule.wake
-  sleep    = local.cfg.schedule.sleep
 
-  # Baseline wake/sleep as minutes-since-midnight for the reconciler.
-  wake_min  = tonumber(split(":", local.wake)[0]) * 60 + tonumber(split(":", local.wake)[1])
-  sleep_min = tonumber(split(":", local.sleep)[0]) * 60 + tonumber(split(":", local.sleep)[1])
+  # Working hours: an optional recurring window during which auto-suspend is
+  # disabled. Mirror internal/config: a present block is active unless enabled is
+  # explicitly false. A disabled window is signalled to the reconciler with -1.
+  work_hours   = try(local.cfg.schedule.working_hours, null)
+  work_enabled = local.work_hours != null && coalesce(try(local.work_hours.enabled, null), true)
+  work_start   = try(local.work_hours.start, "")
+  work_end     = try(local.work_hours.end, "")
+  # HH:MM, as internal/schedule.ParseDayTime accepts; a malformed value yields
+  # -1 here and is reported by the precondition in workflow.tf.
+  hhmm_re       = "^([01]?[0-9]|2[0-3]):[0-5]?[0-9]$"
+  work_times_ok = can(regex(local.hhmm_re, local.work_start)) && can(regex(local.hhmm_re, local.work_end))
+  work_start_min = local.work_enabled && local.work_times_ok ? (
+    tonumber(split(":", local.work_start)[0]) * 60 + tonumber(split(":", local.work_start)[1])
+  ) : -1
+  work_end_min = local.work_enabled && local.work_times_ok ? (
+    tonumber(split(":", local.work_end)[0]) * 60 + tonumber(split(":", local.work_end)[1])
+  ) : -1
+
+  # Weekdays the working-hours window is active on, as Go weekday numbers
+  # (Sun=0..Sat=6, matching time.Weekday). Absent -> every day. Mirrors the
+  # weekday parsing in internal/config; a YAML null (`days:`) also means every day.
+  work_day_names = coalesce(try(local.work_hours.days, null), [])
+  work_day_num = {
+    sun = 0, sunday = 0
+    mon = 1, monday = 1
+    tue = 2, tues = 2, tuesday = 2
+    wed = 3, weds = 3, wednesday = 3
+    thu = 4, thur = 4, thurs = 4, thursday = 4
+    fri = 5, friday = 5
+    sat = 6, saturday = 6
+  }
+  # Normalized once so the lookup, the filter and the precondition agree.
+  work_day_keys = [for d in local.work_day_names : lower(trimspace(d))]
+  work_days_unknown = [
+    for i, k in local.work_day_keys : local.work_day_names[i]
+    if !contains(keys(local.work_day_num), k)
+  ]
+  work_days = local.work_enabled ? (
+    length(local.work_day_keys) > 0
+    # Unknown names are skipped here (not indexed) so the precondition in
+    # workflow.tf is reached and reports them clearly.
+    ? [for k in local.work_day_keys : local.work_day_num[k] if contains(keys(local.work_day_num), k)]
+    : [0, 1, 2, 3, 4, 5, 6]
+  ) : []
+  # Set form the reconciler checks weekday membership against: {"1": true, ...}.
+  # distinct() so repeated spellings of one day (e.g. [mon, monday]) collapse as
+  # they do in config.Weekdays, instead of failing with a duplicate-key error.
+  work_days_map = { for d in distinct(local.work_days) : tostring(d) => true }
+
+  # Idle-shutdown timeout in minutes. Absent -> 30 (mirrors internal/config);
+  # an explicit 0 disables idle shutdown. coalesce (not a bare try default) so a
+  # YAML null (`idle_timeout_minutes:`) also defaults, as it does in Go.
+  idle_min = coalesce(try(local.cfg.schedule.idle_timeout_minutes, null), 30)
 
   # Read by both the CLI and the reconciler; an empty-vs-absent mismatch here
   # would make them target different Firestore documents (see the note above).
@@ -70,6 +119,13 @@ locals {
 
   # Stable device name -> /dev/disk/by-id/google-<device_name> on the guest.
   data_device_name = "${local.name}-data"
+
+  # Guest-attributes path the VM activity emitter writes and the reconciler reads
+  # (unix seconds since the VM was last active). This is the contract with
+  # internal/compute.LastActiveQueryPath — change both together.
+  activity_key = "workbox/last_active"
+  # The key alone, as it appears in a getGuestAttributes response item.
+  activity_key_name = split("/", local.activity_key)[1]
 
   labels = {
     managed-by = "workbox"

@@ -3,6 +3,7 @@ package compute
 import (
 	"context"
 	"sync"
+	"time"
 )
 
 // Fake is an in-memory Compute for tests. It records the operations invoked and
@@ -61,4 +62,36 @@ func (f *Fake) op(name string, result State) error {
 	return nil
 }
 
-var _ Compute = (*Fake)(nil)
+// FakeActivity is an in-memory Activity for tests. ActiveAt/ActiveOK are what
+// LastActive reports and LastStartAt what LastStart reports; ActiveErr and
+// LastStartErr are the matching failures. A zero LastStartAt reports the
+// instance as never started.
+type FakeActivity struct {
+	ActiveAt     time.Time
+	ActiveOK     bool
+	ActiveErr    error
+	LastStartAt  time.Time
+	LastStartErr error
+}
+
+// LastActive returns the scripted values. As with the real client, an error
+// comes with no value.
+func (f FakeActivity) LastActive(_ context.Context) (time.Time, bool, error) {
+	if f.ActiveErr != nil {
+		return time.Time{}, false, f.ActiveErr
+	}
+	return f.ActiveAt, f.ActiveOK, nil
+}
+
+// LastStart returns the scripted start time.
+func (f FakeActivity) LastStart(_ context.Context) (time.Time, bool, error) {
+	if f.LastStartErr != nil {
+		return time.Time{}, false, f.LastStartErr
+	}
+	return f.LastStartAt, !f.LastStartAt.IsZero(), nil
+}
+
+var (
+	_ Compute  = (*Fake)(nil)
+	_ Activity = FakeActivity{}
+)

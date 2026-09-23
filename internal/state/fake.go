@@ -5,14 +5,21 @@ import "context"
 // Fake is an in-memory Store for tests.
 type Fake struct {
 	Doc *Document
-	// Err, when non-nil, is returned by Load, Save, and Clear.
-	Err error
+	// Err, when non-nil, is returned by Load, Save and Clear; LoadErr and
+	// SaveErr override it for that method alone, so a test can fail just the
+	// read or just the write.
+	Err     error
+	LoadErr error
+	SaveErr error
 }
 
 // NewFake returns an empty in-memory store.
 func NewFake() *Fake { return &Fake{Doc: &Document{}} }
 
 func (f *Fake) Load(_ context.Context) (*Document, error) {
+	if f.LoadErr != nil {
+		return nil, f.LoadErr
+	}
 	if f.Err != nil {
 		return nil, f.Err
 	}
@@ -23,6 +30,9 @@ func (f *Fake) Load(_ context.Context) (*Document, error) {
 }
 
 func (f *Fake) Save(_ context.Context, doc *Document) error {
+	if f.SaveErr != nil {
+		return f.SaveErr
+	}
 	if f.Err != nil {
 		return f.Err
 	}
@@ -45,7 +55,6 @@ var _ Store = (*Fake)(nil)
 // isolation that the real Firestore store provides.
 func deepCopyDoc(d *Document) *Document {
 	cp := *d
-	cp.Wake = copySpan(d.Wake)
 	cp.Sleep = copySpan(d.Sleep)
 	cp.Hold = copySpan(d.Hold)
 	return &cp

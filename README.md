@@ -2,8 +2,8 @@
 
 Turn a persistent GCP Compute Engine VM into a "second computer." Running `workbox`
 wakes the VM, waits for it to become reachable over Tailscale/SSH, and opens a
-[Herdr](https://herdr.dev) session. A small control plane keeps the VM asleep on a
-schedule so you only pay for compute when you use it.
+[Herdr](https://herdr.dev) session. Wake is always manual; a small control plane
+suspends the VM once it goes idle, so you only pay for compute while you use it.
 
 The VM has a public egress IP but **no public inbound**. All SSH is over Tailscale.
 
@@ -12,12 +12,16 @@ The VM has a public egress IP but **no public inbound**. All SSH is over Tailsca
 Two independent planes.
 
 ```
-CONTROL PLANE (power state + schedule)
+CONTROL PLANE (power state)
 
-  workbox CLI ──> GCP Workflow ──> Compute Engine API (suspend / resume / start)
-       │                        └─> Firestore state doc (holds, overrides, schedule)
-       │
-       └─ Cloud Scheduler ──(1/min)──> reconciler Workflow ──> reconciles VM to schedule
+  workbox CLI ──> Compute Engine API   (wake: resume / start; sleep: suspend)
+              └─> Firestore state doc  (keep-awake hold, scheduled sleep)
+
+  VM emitter ──> guest attribute       (workbox/last_active)
+
+  Cloud Scheduler ──(1/min)──> reconciler Workflow ──> suspends the VM when idle
+                                                       (outside working hours), or when a
+                                                       scheduled sleep is due; never wakes
 
 CONNECTIVITY PLANE (interactive access)
 
@@ -25,11 +29,14 @@ CONNECTIVITY PLANE (interactive access)
                     (MagicDNS)    (key-only)        (server, panes, sessions live on VM)
 ```
 
-The control plane is a Go CLI plus a GCP Workflow that calls Google Cloud APIs to
-change power state and read/write a tiny Firestore state document. The connectivity
-plane is entirely local → Tailscale → OpenSSH → VM → Herdr. Because Herdr keeps its
-server, panes, and sessions on the VM and the local client merely attaches over
-OpenSSH, sessions survive suspend/resume.
+The control plane is a Go CLI that calls Google Cloud APIs directly to wake the VM
+and read/write a tiny Firestore state document, plus a once-a-minute reconciler
+Workflow that suspends the VM when it is idle and outside working hours, or when
+a scheduled sleep (`workbox sleep HH:MM`) is due. The reconciler is suspend-only
+— it never wakes the VM. The connectivity plane is entirely local → Tailscale →
+OpenSSH → VM → Herdr. Because Herdr keeps its server, panes, and sessions on the
+VM and the local client merely attaches over OpenSSH, sessions survive
+suspend/resume.
 
 See [docs/architecture.md](docs/architecture.md) for detail.
 
@@ -105,8 +112,10 @@ Tailscale account. Those must already exist.
    ```
 
 On first boot the VM's startup script mounts `/work`, joins Tailscale with a
-single-use tagged key, hardens SSH to key-only, installs Docker, installs Claude Code
-and Herdr for the dev user, and runs `herdr integration install claude`.
+single-use tagged key, hardens SSH to key-only, creates the swapfile
+(`machine.swap_gb`), installs the activity emitter that reports last-active for
+idle shutdown, installs Docker, installs Claude Code and Herdr for the dev user,
+and runs `herdr integration install claude`.
 
 ## Configuration
 
@@ -123,7 +132,7 @@ gcp:
   project_id: your-project
   region: europe-north2
   zone: europe-north2-a
-  machine_type: e2-custom-8-16384   # 8 vCPU / 16 GB
+  machine_type: e2-custom-8-16384   # 8 vCPU / 16 GB; E2 supports suspend/resume
   boot_disk_gb: 30
   data_disk_gb: 200
   # optional:
@@ -147,9 +156,19 @@ tailscale:
   manage_policy: false             # DANGER; see below. Default false.
 
 schedule:
-  timezone: Europe/Stockholm
-  wake: "06:00"
-  sleep: "23:00"                   # wake MUST be earlier than sleep
+  timezone: Europe/Stockholm       # IANA tz; DST handled automatically
+  # Wake is always manual; the VM auto-suspends on idle. Both controls optional.
+  working_hours:                   # window where automatic suspend is DISABLED; omit = none
+    start: "06:00"
+    end: "23:00"                   # start MUST be earlier than end
+    # days: [mon, tue, wed, thu, fri]   # restrict to weekdays; omit = every day
+    # enabled: false                    # keep the window configured but inactive
+  idle_timeout_minutes: 30         # outside working hours, suspend after N idle min; 0 disables
+
+# optional; CLI-only connectivity probe tuning (not read by Terraform):
+ssh:
+  connect_timeout_seconds: 15      # per-probe SSH connect timeout
+  wait_timeout_seconds: 180        # overall wait-for-SSH budget after a wake
 
 state:
   firestore_database: "(default)"
@@ -161,7 +180,12 @@ state:
 Notes:
 
 - `ssh_public_key_file` must point at your **public** key.
-- `schedule.wake` must be earlier than `schedule.sleep`.
+- `schedule.working_hours.start` must be earlier than `.end` when the window is
+  enabled. Omit the `working_hours` block (or set `enabled: false`) to apply idle
+  shutdown around the clock.
+- `schedule.idle_timeout_minutes` must be at least 5 (the activity emitter reports
+  about once a minute); `0` disables idle shutdown entirely, leaving only manual
+  `workbox sleep` / scheduled sleep.
 - `state.firestore_location` is `eur3` because `europe-north2` is not a valid
   Firestore location.
 
@@ -275,45 +299,103 @@ are needed — the browser sees a genuine `localhost`.
 
 ```
 workbox                 # default: wake, wait for SSH, open Herdr
-workbox status [--json] # human or JSON state
-workbox wake            # resume/start now; sets a stay-awake hold if the schedule wants it asleep
-workbox sleep           # (alias: workbox off) suspend now; stay-asleep hold if schedule wants awake
-workbox ssh [-- args]   # wake, wait, then hand off to your ssh client
+workbox status [--json] # human or JSON state (VM, working hours, activity, auto-suspend verdict)
+workbox wake            # resume/start now (manual wake only; short keep-awake grace when idle shutdown is on)
+workbox sleep [HH:MM]   # (alias: workbox off) suspend now, or schedule a one-off suspend at HH:MM (or HHMM)
+workbox ssh [-- args]   # wake, wait, then hand off to your ssh client (progress on stderr)
 workbox herdr           # wake, wait, open Herdr (same as bare `workbox`)
 workbox forward PORT... # wake, wait, then hold local port-forwards to the VM open (browser review)
-workbox wake-at HH:MM   # one-workday wake override
-workbox sleep-at HH:MM  # one-workday sleep override (handles past-midnight like 01:30)
-workbox keep-awake 3h   # hold awake for a Go duration (3h, 90m)
-workbox cancel-override # clear overrides and holds
-workbox schedule        # show normal schedule, overrides, holds, next transitions
+workbox keep-awake 3h   # wake if needed, then hold awake for a Go duration (3h, 90m)
+workbox cancel          # clear the scheduled sleep and keep-awake hold
+workbox schedule        # show working hours, idle shutdown, keep-awake hold, scheduled sleep
 workbox doctor          # read-only diagnostics (never wakes unless you pass --wake)
 workbox --version
 ```
 
 Global flag: `--config PATH`. Environment: `WORKBOX_CONFIG=PATH`.
 
-## Daily usage and schedule overrides
+### `workbox status --json`
 
-Start your day:
+The machine-readable status document:
+
+```json
+{
+  "name": "workbox",
+  "vm": "RUNNING",
+  "schedule": {
+    "timezone": "Europe/Stockholm",
+    "working_hours": { "enabled": true, "start": "06:00", "end": "23:00",
+                       "days": ["Mon"], "within": false },
+    "idle_timeout_minutes": 30
+  },
+  "auto_suspend": { "suspend": false, "reason": "active" },
+  "activity": { "last_active": "2026-06-15T23:20:00+02:00", "idle_seconds": 600 },
+  "last_start": "2026-06-15T21:30:00+02:00",
+  "keep_awake": { "start": "...", "end": "...", "state": "awake" },
+  "scheduled_sleep": { "start": "...", "end": "...", "state": "asleep" },
+  "ssh": { "target": "workbox", "available": true }
+}
+```
+
+The example lists the fields for reference; a real document carries only the
+applicable ones.
+
+`activity`, `last_start`, `keep_awake` and `scheduled_sleep` are present only
+when known, and `ssh.reason` only when `ssh.available` is false (it says why).
+`activity.idle_seconds` measures from `last_active` alone, while auto-suspend
+counts idle from the later of `last_active` and `last_start` — during boot
+grace they differ, so read `auto_suspend.reason` for the verdict. A last-active
+value workbox disregards (not a usable unix timestamp, or more than five
+minutes in the future) is reported as `activity_ignored` instead of `activity`;
+a failed read appears as `activity_error` or `last_start_error`.
+
+**Read `auto_suspend.reason` before `auto_suspend.suspend`.** `suspend` is
+meaningful only for the reconciler's own verdicts — `scheduled-sleep`,
+`keep-awake`, `working-hours`, `idle-disabled`, `active`, `boot-grace`,
+`no-activity` and `idle`. For the two status-only reasons, `not-running` (the VM
+is not RUNNING) and `activity-unknown` (activity or last start could not be read),
+the verdict is unknown and `suspend` is always `false`.
+
+## Daily usage and auto-suspend
+
+Wake is always manual; the VM suspends itself once it goes idle.
 
 ```sh
 workbox                    # wake, wait, open Herdr
 ```
 
-Overrides let you deviate from your configured schedule for a single workday
-without editing config.
+The VM stays awake while you work and suspends on its own afterward. Two optional
+controls govern automatic suspend (both configured under `schedule`, see
+[Configuration](#configuration)):
+
+- **Working hours** — a recurring local-time window during which automatic suspend
+  is **disabled**. The VM never wakes on its own for it; it only refrains from
+  suspending.
+- **Idle shutdown** — outside working hours, the VM suspends after
+  `idle_timeout_minutes` with no activity: no Herdr agent working **and** no open
+  inbound SSH connection (a `workbox forward` tunnel, an attached Herdr client,
+  or a lingering `ControlPersist` master all count — keep `ControlPersist` short
+  for the workbox host). Idle time counts from the later of the last activity
+  and the VM's last boot, so a freshly started VM always gets the full timeout.
+  Long-running commands that are not a Herdr agent (a build in a pane, `nohup`,
+  detached containers) do **not** count: run `workbox keep-awake 2h` before
+  walking away from one. Set `0` to disable.
+
+Adjust the moment without editing config:
 
 ```sh
-workbox sleep-at 01:30     # stay up past midnight tonight; back to normal tomorrow
-workbox wake-at 08:30      # sleep in tomorrow
-workbox wake-at 05:00      # start early tomorrow
-workbox sleep-at 20:00     # wind down early
-workbox keep-awake 3h      # hold awake for the next 3 hours
+workbox keep-awake 3h      # wake if needed, then hold awake for the next 3 hours
+workbox sleep              # suspend right now
+workbox sleep 01:30        # schedule a one-off suspend at 01:30 (handles past-midnight)
+workbox cancel             # clear a scheduled sleep and the keep-awake hold
 ```
 
-Manual actions set holds that the scheduler respects. For example, `workbox wake` at
-01:00 will **not** be re-suspended by the reconciler, because `wake` sets a temporary
-stay-awake hold.
+`workbox wake` sets a keep-awake grace (the idle timeout plus the SSH wait timeout)
+so a freshly woken VM is not suspended while it resumes or before the on-VM
+activity emitter first reports. With idle shutdown disabled no grace is set: it
+only guards against idle shutdown, and a scheduled sleep wins over a hold
+regardless. A VM started any other way (first provisioning, a Terraform
+replacement, the Console) is covered by the boot grace above.
 
 Inspect current state:
 
@@ -322,11 +404,14 @@ workbox status
 workbox schedule
 ```
 
-**Precedence:** manual hold > one-workday override > baseline schedule. Overrides are
-one-shot and auto-expire.
+**Precedence:** scheduled sleep > keep-awake hold > working hours > idle shutdown.
+Scheduled sleep and keep-awake are one-shot and expire by time.
 
-To change the schedule **permanently**, edit `schedule.wake` / `schedule.sleep` in
-your config and run `make tf-apply`. The schedule is not editable at runtime.
+To change working hours or the idle timeout **permanently**, edit the `schedule`
+block in your config and run `make tf-apply`; the reconciler is generated from
+config, so these are not editable at runtime. The runtime commands above
+(`wake`/`sleep`/`keep-awake`/`cancel`) change no config: apart from resuming or
+suspending the VM, they only write short-lived state to Firestore.
 
 ## Make targets
 
@@ -372,7 +457,6 @@ so it is not deleted when the instance is replaced. To rebuild the VM in place:
 
 The enrollment key is replaced with the instance because the old one is
 single-use and already consumed: a new VM given it could not join the tailnet.
-
 
 Alternatively, detach and reattach the disk. Either way, **`/work` survives**. See
 [docs/operations.md](docs/operations.md) for the exact detach/reattach steps.

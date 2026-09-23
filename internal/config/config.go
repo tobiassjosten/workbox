@@ -10,9 +10,11 @@ package config
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -83,11 +85,85 @@ type Tailscale struct {
 	ManagePolicy bool `yaml:"manage_policy"`
 }
 
-// Schedule holds the baseline recurring schedule.
+// Schedule holds the timezone, the optional working-hours protection window, and
+// the idle-shutdown timeout.
 type Schedule struct {
+	// Timezone is the IANA timezone for working hours and the VM clock.
 	Timezone string `yaml:"timezone"`
-	Wake     string `yaml:"wake"`
-	Sleep    string `yaml:"sleep"`
+	// WorkingHours is the optional protected window; nil means no window.
+	WorkingHours *WorkingHours `yaml:"working_hours"`
+	// IdleTimeoutMinutes is how long the VM may be inactive outside working hours
+	// before auto-suspend. A pointer so an absent key defaults to
+	// defaultIdleTimeoutMinutes while an explicit 0 disables idle shutdown.
+	IdleTimeoutMinutes *int `yaml:"idle_timeout_minutes"`
+}
+
+// WorkingHours is a recurring window, optionally limited to certain weekdays,
+// during which idle shutdown is disabled.
+type WorkingHours struct {
+	// Enabled defaults to true when the block is present; set false to keep the
+	// window configured but inactive.
+	Enabled *bool  `yaml:"enabled"`
+	Start   string `yaml:"start"`
+	End     string `yaml:"end"`
+	// Days restricts the window to these weekdays (e.g. [mon, tue, wed, thu, fri]).
+	// Names are case-insensitive: 3-letter, full, or the common abbreviations in
+	// weekdayNames (tues, weds, thur, thurs). Empty means every day.
+	Days []string `yaml:"days"`
+}
+
+// weekdayNames maps accepted day spellings to time.Weekday.
+var weekdayNames = map[string]time.Weekday{
+	"sun": time.Sunday, "sunday": time.Sunday,
+	"mon": time.Monday, "monday": time.Monday,
+	"tue": time.Tuesday, "tues": time.Tuesday, "tuesday": time.Tuesday,
+	"wed": time.Wednesday, "weds": time.Wednesday, "wednesday": time.Wednesday,
+	"thu": time.Thursday, "thur": time.Thursday, "thurs": time.Thursday, "thursday": time.Thursday,
+	"fri": time.Friday, "friday": time.Friday,
+	"sat": time.Saturday, "saturday": time.Saturday,
+}
+
+// Weekdays parses Days into distinct time.Weekday values (empty stays empty =
+// every day); duplicates such as [mon, monday] collapse to one.
+func (w *WorkingHours) Weekdays() ([]time.Weekday, error) {
+	if w == nil || len(w.Days) == 0 {
+		return nil, nil
+	}
+	out := make([]time.Weekday, 0, len(w.Days))
+	for _, name := range w.Days {
+		wd, ok := weekdayNames[strings.ToLower(strings.TrimSpace(name))]
+		if !ok {
+			return nil, fmt.Errorf("schedule.working_hours.days: unknown day %q (use names like mon, tue or monday, tuesday)", name)
+		}
+		if !slices.Contains(out, wd) {
+			out = append(out, wd)
+		}
+	}
+	return out, nil
+}
+
+// Active reports whether the working-hours window is present and enabled.
+func (w *WorkingHours) Active() bool {
+	return w != nil && (w.Enabled == nil || *w.Enabled)
+}
+
+// Firestore document defaults (database and collection), mirrored in
+// infra/locals.tf: the CLI and the reconciler must target the same document.
+const (
+	defaultFirestoreDatabase = "(default)"
+	defaultStateCollection   = "workbox"
+)
+
+// defaultIdleTimeoutMinutes is used when idle_timeout_minutes is absent.
+const defaultIdleTimeoutMinutes = 30
+
+// IdleTimeout returns the configured idle-shutdown duration (0 disables it).
+func (s Schedule) IdleTimeout() time.Duration {
+	m := defaultIdleTimeoutMinutes
+	if s.IdleTimeoutMinutes != nil {
+		m = *s.IdleTimeoutMinutes
+	}
+	return time.Duration(m) * time.Minute
 }
 
 // State holds Firestore operational-state locations.
@@ -174,8 +250,32 @@ func Load(flagPath string) (*Config, error) {
 	return Parse(data)
 }
 
+// minIdleTimeoutMinutes is the shortest accepted idle timeout. The on-VM
+// emitter reports about once a minute (up to ~75 s apart) and the reconciler
+// ticks once a minute, so a shorter timeout could suspend a VM in use. Mirrored
+// by the precondition in infra/workflow.tf.
+const minIdleTimeoutMinutes = 5
+
+// errLegacySchedule explains the retired schedule.wake/schedule.sleep keys; the
+// Terraform precondition in infra/workflow.tf reports the same migration.
+var errLegacySchedule = errors.New("schedule.wake/schedule.sleep were replaced by schedule.working_hours.start/end; " +
+	"migrate your config, then follow docs/operations.md (\"Upgrading from schedule.wake/sleep\") before `make tf-apply`")
+
 // Parse decodes, defaults and validates config bytes.
 func Parse(data []byte) (*Config, error) {
+	// Catch the retired schedule.wake/sleep keys before strict decoding, which
+	// would only report a generic unknown-field error.
+	var legacy struct {
+		Schedule struct {
+			Wake  *string `yaml:"wake"`
+			Sleep *string `yaml:"sleep"`
+		} `yaml:"schedule"`
+	}
+	if err := yaml.Unmarshal(data, &legacy); err == nil &&
+		(legacy.Schedule.Wake != nil || legacy.Schedule.Sleep != nil) {
+		return nil, errLegacySchedule
+	}
+
 	var c Config
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
@@ -205,13 +305,13 @@ func (c *Config) Defaults() {
 		c.Machine.DataMount = "/work"
 	}
 	if c.State.FirestoreDatabase == "" {
-		c.State.FirestoreDatabase = "(default)"
+		c.State.FirestoreDatabase = defaultFirestoreDatabase
 	}
 	if c.State.FirestoreLocation == "" {
 		c.State.FirestoreLocation = "eur3"
 	}
 	if c.State.Collection == "" {
-		c.State.Collection = "workbox"
+		c.State.Collection = defaultStateCollection
 	}
 	if c.State.Document == "" {
 		c.State.Document = c.Name
@@ -238,8 +338,6 @@ func (c *Config) Validate() error {
 	req("machine.ssh_public_key_file", c.Machine.SSHPublicKeyFile)
 	req("tailscale.hostname", c.Tailscale.Hostname)
 	req("schedule.timezone", c.Schedule.Timezone)
-	req("schedule.wake", c.Schedule.Wake)
-	req("schedule.sleep", c.Schedule.Sleep)
 	if len(missing) > 0 {
 		return fmt.Errorf("config is missing required fields: %s", strings.Join(missing, ", "))
 	}
@@ -249,25 +347,41 @@ func (c *Config) Validate() error {
 	if c.GCP.DataDiskGB <= 0 {
 		return fmt.Errorf("gcp.data_disk_gb must be positive")
 	}
+	if n := c.Schedule.IdleTimeoutMinutes; n != nil && *n != 0 && *n < minIdleTimeoutMinutes {
+		return fmt.Errorf("schedule.idle_timeout_minutes must be 0 (disabled) or at least %d", minIdleTimeoutMinutes)
+	}
+	if c.Machine.SwapGB != nil && *c.Machine.SwapGB < 0 {
+		return fmt.Errorf("machine.swap_gb must not be negative")
+	}
 	if c.SSH.ConnectTimeoutSeconds != nil && *c.SSH.ConnectTimeoutSeconds <= 0 {
 		return fmt.Errorf("ssh.connect_timeout_seconds must be positive")
 	}
 	if c.SSH.WaitTimeoutSeconds != nil && *c.SSH.WaitTimeoutSeconds <= 0 {
 		return fmt.Errorf("ssh.wait_timeout_seconds must be positive")
 	}
-	if c.Machine.SwapGB != nil && *c.Machine.SwapGB < 0 {
-		return fmt.Errorf("machine.swap_gb must not be negative")
+	// Day names are checked even for a disabled window, as Terraform does.
+	if _, err := c.Schedule.WorkingHours.Weekdays(); err != nil {
+		return err
 	}
-	// Building the schedule validates timezone, HH:MM format and wake<sleep.
+	// Building the schedule validates the timezone and, when working hours are
+	// enabled, the HH:MM format and start<end ordering.
 	if _, err := c.Schedule.Build(); err != nil {
 		return err
 	}
 	return nil
 }
 
-// Build turns the schedule config into a schedule.Schedule.
+// Build turns the schedule config into a schedule.Schedule. When working hours
+// are absent or disabled the result is a window-less (idle-only) schedule.
 func (s Schedule) Build() (schedule.Schedule, error) {
-	return schedule.New(s.Wake, s.Sleep, s.Timezone)
+	if s.WorkingHours.Active() {
+		days, err := s.WorkingHours.Weekdays()
+		if err != nil {
+			return schedule.Schedule{}, err
+		}
+		return schedule.New(s.WorkingHours.Start, s.WorkingHours.End, s.Timezone, days...)
+	}
+	return schedule.Disabled(s.Timezone)
 }
 
 // SSHPublicKeyPath returns the SSH public key path with ~ expanded.

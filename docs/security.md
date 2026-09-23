@@ -39,6 +39,28 @@ harmless:
 A token stolen from the metadata server can write logs and metrics and nothing
 more.
 
+The idle-suspend **activity signal is one-way and needs no extra VM privilege**:
+the VM writes its own `workbox/last_active` guest attribute (authorized by the
+metadata server for the instance itself, gated by `enable-guest-attributes`), and
+the reconciler *reads* it with `compute.instances.getGuestAttributes`. The VM SA
+is unchanged — the signal never puts the VM near Firestore or any admin API.
+The trade-off: any process on the VM can write that attribute too, so an
+untrusted workload could keep reporting activity and hold the VM awake. A single
+forged write does not last: the reconciler ignores a value more than five minutes
+in the future or one that is not a number, so each forged value expires like a
+real one. The impact is cost only — no privilege is gained, and a scheduled sleep
+still wins — and idle shutdown is a cost control, not a security boundary.
+
+The signal is a socket check, not a session check: the emitter counts any
+established inbound connection on port 22, and a socket reaches that state
+before SSH authentication. Anyone the tailnet policy lets reach `tcp:22` can
+therefore hold the VM awake by connecting repeatedly, without any key. The
+shipped policy fragment grants a single identity; when Terraform owns the policy
+(`tailscale.manage_policy: true`) the grant is `autogroup:member` — every member
+of your tailnet — unless `tailscale.user` is set. `LoginGraceTime 30` closes each
+unauthenticated connection after 30 s. Again the cost is money, not access: an
+unauthenticated peer gets no shell, no data and no privilege.
+
 ## Public IP but no public ingress
 
 The VM has an ephemeral external IP for outbound traffic (package installs,
@@ -52,10 +74,15 @@ public port. Inbound access is exclusively over Tailscale.
   (`ssh-keys`), with `block-project-ssh-keys=true`. **No private key ever reaches
   the VM.**
 - `sshd` is hardened by the bootstrap script: `PasswordAuthentication no`,
-  `KbdInteractiveAuthentication no`, `PermitRootLogin no`, public-key only.
+  `KbdInteractiveAuthentication no`, `PermitRootLogin no`, public-key only. It
+  also sets `ClientAliveInterval 60` / `ClientAliveCountMax 3`, so a dead session
+  (laptop asleep, off the tailnet) is dropped within ~3 min and its stale
+  ESTABLISHED socket stops counting as activity.
 - `workbox ssh` execs the user's **local** OpenSSH, so hardware-backed keys,
-  ssh-agent, `known_hosts`, `ProxyJump` and `ControlMaster` all work as usual.
-  There is no Go SSH implementation and no key material in this repository.
+  ssh-agent, `known_hosts`, `ProxyJump` and `ControlMaster` all work as usual
+  (a persistent master counts as activity and holds off idle shutdown; the
+  non-interactive probes opt out of multiplexing). There is no Go SSH
+  implementation and no key material in this repository.
 
 ### Forwarded ssh-agent (Git access from the VM)
 
@@ -146,10 +173,10 @@ plan files.
 
 ## Firestore operational state
 
-Firestore holds only the tiny scheduling document (override/hold spans and
-timestamps) — **no secrets, no project data**. Access is by IAM, not public
-Firestore rules: the Workflow SA and the operator role can read/write it; nothing
-else can.
+Firestore holds only the tiny scheduling document (scheduled-sleep and
+keep-awake spans, and timestamps) — **no secrets, no project data**. Access is
+by IAM, not public Firestore rules: the Workflow SA and the operator role can
+read/write it; nothing else can.
 
 ## Least privilege (IAM summary)
 
@@ -158,9 +185,9 @@ Three service accounts plus a human role, each scoped to exactly its job:
 | Identity            | Grants                                                                 |
 |---------------------|------------------------------------------------------------------------|
 | `workbox-vm`        | `logging.logWriter`, `monitoring.metricWriter` (telemetry only)        |
-| `workbox-workflow`  | custom role: `compute.instances.get/start/resume/suspend`, `compute.zoneOperations.get`; plus `roles/datastore.user`, `roles/logging.logWriter` |
+| `workbox-workflow`  | custom role: `compute.instances.get/getGuestAttributes/suspend`, `compute.zoneOperations.get`; plus `roles/datastore.user`, `roles/logging.logWriter` |
 | `workbox-scheduler` | `roles/workflows.invoker`                                              |
-| human/CLI (you)     | custom `workboxOperator` role: `compute.instances.get/start/resume/suspend`, `compute.zoneOperations.get`; plus Firestore `datastore.entities.get/create/update/delete` and `datastore.databases.get` |
+| human/CLI (you)     | custom `workboxOperator` role: `compute.instances.get/getGuestAttributes/start/resume/suspend`, `compute.zoneOperations.get`; plus Firestore `datastore.entities.get/create/update/delete` and `datastore.databases.get` |
 
 No primitive roles (Owner/Editor) are used anywhere. Grant yourself the operator
 role with the command in the `next_steps` / `operator_role` Terraform outputs.

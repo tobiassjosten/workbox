@@ -1,6 +1,8 @@
 package config
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -9,7 +11,8 @@ import (
 	"time"
 )
 
-const minimal = `
+// base is a valid config with no working-hours block; minimal adds one.
+const base = `
 name: workbox
 gcp:
   project_id: example-project
@@ -25,8 +28,11 @@ tailscale:
   hostname: workbox
 schedule:
   timezone: Europe/Stockholm
-  wake: "06:00"
-  sleep: "23:00"
+`
+
+const minimal = base + `  working_hours:
+    start: "06:00"
+    end: "23:00"
 `
 
 func TestParseAndDefaults(t *testing.T) {
@@ -52,8 +58,75 @@ func TestParseAndDefaults(t *testing.T) {
 	if c.GCP.DeletionProtection == nil || !*c.GCP.DeletionProtection {
 		t.Errorf("DeletionProtection default should be true")
 	}
-	if _, err := c.Schedule.Build(); err != nil {
-		t.Errorf("Schedule.Build: %v", err)
+	// Idle timeout defaults to 30 minutes when the key is absent.
+	if got := c.Schedule.IdleTimeout(); got != 30*time.Minute {
+		t.Errorf("IdleTimeout default = %v, want 30m", got)
+	}
+	if !c.Schedule.WorkingHours.Active() {
+		t.Error("working hours should be active when present without enabled:false")
+	}
+	sc, err := c.Schedule.Build()
+	if err != nil {
+		t.Fatalf("Schedule.Build: %v", err)
+	}
+	if !sc.Enabled {
+		t.Error("built schedule should have working hours enabled")
+	}
+}
+
+func TestWorkingHoursDaysDeduped(t *testing.T) {
+	w := &WorkingHours{Days: []string{"mon", "Monday", "tue"}}
+	days, err := w.Weekdays()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(days) != 2 || days[0] != time.Monday || days[1] != time.Tuesday {
+		t.Errorf("Weekdays = %v, want [Monday Tuesday]", days)
+	}
+}
+
+func TestUnknownDayRejectedWhenWindowDisabled(t *testing.T) {
+	cfg := minimal + "    enabled: false\n    days: [mon, funday]\n"
+	if _, err := Parse([]byte(cfg)); err == nil {
+		t.Error("an unknown day should be rejected even with enabled: false")
+	}
+}
+
+func TestLegacyScheduleKeysExplainMigration(t *testing.T) {
+	for _, key := range []string{"wake", "sleep"} {
+		cfg := base + "  " + key + ": \"06:00\"\n"
+		if _, err := Parse([]byte(cfg)); !errors.Is(err, errLegacySchedule) {
+			t.Errorf("Parse with schedule.%s: err = %v, want errLegacySchedule", key, err)
+		}
+	}
+}
+
+func TestWorkingHoursDays(t *testing.T) {
+	cfg := minimal + "    days: [mon, tue, wed, thu, fri]\n"
+	c, err := Parse([]byte(cfg))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	sc, err := c.Schedule.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sc.Days) != 5 {
+		t.Errorf("expected 5 weekdays, got %v", sc.Days)
+	}
+	// Weekday-only window: Monday inside, Saturday outside.
+	loc, _ := time.LoadLocation("Europe/Stockholm")
+	mon := time.Date(2026, 6, 15, 12, 0, 0, 0, loc)
+	sat := time.Date(2026, 6, 13, 12, 0, 0, 0, loc)
+	if !sc.WithinWorkingHours(mon) || sc.WithinWorkingHours(sat) {
+		t.Error("weekday-only window should include Monday and exclude Saturday")
+	}
+}
+
+func TestWorkingHoursBadDayRejected(t *testing.T) {
+	cfg := minimal + "    days: [mon, funday]\n"
+	if _, err := Parse([]byte(cfg)); err == nil {
+		t.Fatal("expected error for unknown day name")
 	}
 }
 
@@ -63,28 +136,126 @@ func TestParseRejectsUnknownFields(t *testing.T) {
 	}
 }
 
-func TestValidateWakeAfterSleepIsRejected(t *testing.T) {
-	_, err := Parse([]byte(`
-name: workbox
-gcp:
-  project_id: p
-  region: r
-  zone: z
-  machine_type: m
-  boot_disk_gb: 30
-  data_disk_gb: 200
-machine:
-  linux_user: developer
-  ssh_public_key_file: ~/.ssh/id_ed25519.pub
-tailscale:
-  hostname: workbox
-schedule:
-  timezone: Europe/Stockholm
-  wake: "23:00"
-  sleep: "06:00"
-`))
-	if err == nil {
-		t.Fatal("expected error when wake is after sleep")
+func TestWorkingHoursDisabled(t *testing.T) {
+	// enabled:false keeps the window configured but inactive.
+	cfg := minimal + `    enabled: false
+`
+	c, err := Parse([]byte(cfg))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if c.Schedule.WorkingHours.Active() {
+		t.Error("working hours should be inactive when enabled:false")
+	}
+	sc, err := c.Schedule.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sc.Enabled {
+		t.Error("built schedule should have working hours disabled")
+	}
+}
+
+func TestNoWorkingHoursBlock(t *testing.T) {
+	c, err := Parse([]byte(base + "  idle_timeout_minutes: 0\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if c.Schedule.WorkingHours.Active() {
+		t.Error("no working_hours block means inactive")
+	}
+	if got := c.Schedule.IdleTimeout(); got != 0 {
+		t.Errorf("idle_timeout_minutes: 0 should disable idle shutdown, got %v", got)
+	}
+	sc, err := c.Schedule.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sc.Enabled {
+		t.Error("built schedule should be window-less")
+	}
+}
+
+// A YAML null (`idle_timeout_minutes:` with no value) defaults like an absent
+// key; infra/locals.tf relies on the same.
+func TestIdleTimeoutNullDefaults(t *testing.T) {
+	c, err := Parse([]byte(base + "  idle_timeout_minutes:\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := c.Schedule.IdleTimeout(); got != 30*time.Minute {
+		t.Errorf("IdleTimeout = %v, want 30m", got)
+	}
+}
+
+func TestValidateStartAfterEndIsRejected(t *testing.T) {
+	cfg := base + "  working_hours:\n    start: \"23:00\"\n    end: \"06:00\"\n"
+	if _, err := Parse([]byte(cfg)); err == nil {
+		t.Fatal("expected error when working_hours.start is after end")
+	}
+}
+
+func TestValidateIdleTimeoutBounds(t *testing.T) {
+	for _, tc := range []struct {
+		minutes string
+		ok      bool
+	}{
+		{"-5", false},
+		{"1", false}, // below the emitter's reporting gap
+		{"5", true},  // the minimum
+	} {
+		_, err := Parse([]byte(base + "  idle_timeout_minutes: " + tc.minutes + "\n"))
+		if (err == nil) != tc.ok {
+			t.Errorf("idle_timeout_minutes: %s: err = %v, want ok=%v", tc.minutes, err, tc.ok)
+		}
+	}
+}
+
+func TestSSHDefaults(t *testing.T) {
+	c, err := Parse([]byte(minimal))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := c.SSH.ConnectTimeout(); got != 15*time.Second {
+		t.Errorf("ConnectTimeout default = %v, want 15s", got)
+	}
+	if got := c.SSH.WaitTimeout(); got != 180*time.Second {
+		t.Errorf("WaitTimeout default = %v, want 180s", got)
+	}
+}
+
+func TestSSHConfigured(t *testing.T) {
+	cfg := minimal + `ssh:
+  connect_timeout_seconds: 30
+  wait_timeout_seconds: 600
+`
+	c, err := Parse([]byte(cfg))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := c.SSH.ConnectTimeout(); got != 30*time.Second {
+		t.Errorf("ConnectTimeout = %v, want 30s", got)
+	}
+	if got := c.SSH.WaitTimeout(); got != 600*time.Second {
+		t.Errorf("WaitTimeout = %v, want 600s", got)
+	}
+}
+
+func TestValidateBadSSHRejected(t *testing.T) {
+	for _, bad := range []string{
+		"ssh:\n  connect_timeout_seconds: 0\n",
+		"ssh:\n  wait_timeout_seconds: -1\n",
+	} {
+		if _, err := Parse([]byte(minimal + bad)); err == nil {
+			t.Errorf("expected error for %q", bad)
+		}
+	}
+}
+
+func TestValidateNegativeSwapRejected(t *testing.T) {
+	cfg := strings.Replace(base, "  linux_user: developer\n", "  linux_user: developer\n  swap_gb: -1\n", 1)
+	if _, err := Parse([]byte(cfg)); err == nil {
+		t.Fatal("expected error for negative machine.swap_gb")
 	}
 }
 
@@ -143,6 +314,20 @@ func TestLoadMissingFile(t *testing.T) {
 	}
 }
 
+// The shipped example is what `make configure` installs, so it must always
+// parse and validate against the current schema.
+func TestExampleConfigParses(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "workbox.example.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Parse(data); err != nil {
+		t.Errorf("workbox.example.yaml does not parse: %v", err)
+	}
+}
+
+// readInfra returns a file under infra/, for tests pinning the Terraform side of
+// a contract.
 func readInfra(t *testing.T, name string) string {
 	t.Helper()
 	raw, err := os.ReadFile("../../infra/" + name)
@@ -165,50 +350,56 @@ func TestTailscaleKeyEntryIsIgnored(t *testing.T) {
 	}
 }
 
-func TestValidateNegativeSwapRejected(t *testing.T) {
-	cfg := strings.Replace(minimal, "  linux_user: developer\n", "  linux_user: developer\n  swap_gb: -1\n", 1)
-	if _, err := Parse([]byte(cfg)); err == nil {
-		t.Fatal("expected error for negative machine.swap_gb")
+// TestTerraformMirrorsDefaults checks the values Terraform duplicates from this
+// package (infra/locals.tf, infra/workflow.tf), so a one-sided change fails.
+func TestTerraformMirrorsDefaults(t *testing.T) {
+	locals, workflow := readInfra(t, "locals.tf"), readInfra(t, "workflow.tf")
+	if want := fmt.Sprintf("idle_timeout_minutes, null), %d)", defaultIdleTimeoutMinutes); !strings.Contains(locals, want) {
+		t.Errorf("infra/locals.tf idle default: missing %s", want)
 	}
-}
-
-func TestSSHDefaults(t *testing.T) {
-	c, err := Parse([]byte(minimal))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
+	if want := fmt.Sprintf("local.idle_min >= %d", minIdleTimeoutMinutes); !strings.Contains(workflow, want) {
+		t.Errorf("infra/workflow.tf idle minimum: missing %s", want)
 	}
-	if got := c.SSH.ConnectTimeout(); got != 15*time.Second {
-		t.Errorf("ConnectTimeout default = %v, want 15s", got)
+	// config.Weekdays dedupes repeated spellings, so Terraform must too or
+	// [mon, monday] fails every plan with a duplicate-key error.
+	if want := "distinct(local.work_days)"; !strings.Contains(locals, want) {
+		t.Errorf("infra/locals.tf work_days_map: missing %s", want)
 	}
-	if got := c.SSH.WaitTimeout(); got != 180*time.Second {
-		t.Errorf("WaitTimeout default = %v, want 180s", got)
-	}
-}
-
-func TestSSHConfigured(t *testing.T) {
-	cfg := minimal + `ssh:
-  connect_timeout_seconds: 30
-  wait_timeout_seconds: 600
-`
-	c, err := Parse([]byte(cfg))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	if got := c.SSH.ConnectTimeout(); got != 30*time.Second {
-		t.Errorf("ConnectTimeout = %v, want 30s", got)
-	}
-	if got := c.SSH.WaitTimeout(); got != 600*time.Second {
-		t.Errorf("WaitTimeout = %v, want 600s", got)
-	}
-}
-
-func TestValidateBadSSHRejected(t *testing.T) {
-	for _, bad := range []string{
-		"ssh:\n  connect_timeout_seconds: 0\n",
-		"ssh:\n  wait_timeout_seconds: -1\n",
+	// The CLI and the reconciler must resolve the same Firestore document; a
+	// one-sided default change would silently split their state.
+	for _, want := range []string{
+		fmt.Sprintf(`firestore_database, ""), %q)`, defaultFirestoreDatabase),
+		fmt.Sprintf(`state.collection, ""), %q)`, defaultStateCollection),
+		`try(local.cfg.state.document, ""), local.name)`,
 	} {
-		if _, err := Parse([]byte(minimal + bad)); err == nil {
-			t.Errorf("expected error for %q", bad)
+		if !strings.Contains(locals, want) {
+			t.Errorf("infra/locals.tf state defaults: missing %s", want)
+		}
+	}
+	// The retired-key precondition must stay on the Terraform side too, or an
+	// unmigrated config would apply an idle-only reconciler.
+	if want := "try(local.cfg.schedule.wake, null) == null"; !strings.Contains(workflow, want) {
+		t.Errorf("infra/workflow.tf retired-key precondition: missing %s", want)
+	}
+	// minIdleTimeoutMinutes assumes the emitter reports about once a minute; a
+	// slower timer would make the floor unsafe.
+	cloudInit := readInfra(t, "cloud-init.sh.tftpl")
+	for _, want := range []string{"OnUnitActiveSec=1min", "AccuracySec=15s"} {
+		if !strings.Contains(cloudInit, want) {
+			t.Errorf("infra/cloud-init.sh.tftpl emitter timer: missing %s (minIdleTimeoutMinutes assumes it)", want)
+		}
+	}
+	// docs/security.md states both of these as the bounds on how long a socket
+	// can count as activity: an unauthenticated connection (LoginGraceTime) and
+	// a dead session (ClientAlive*).
+	for _, want := range []string{"LoginGraceTime 30", "ClientAliveInterval 60", "ClientAliveCountMax 3"} {
+		if !strings.Contains(cloudInit, want) {
+			t.Errorf("infra/cloud-init.sh.tftpl sshd: missing %s (docs/security.md relies on it)", want)
+		}
+	}
+	for name, wd := range weekdayNames {
+		if want := fmt.Sprintf("%s = %d", name, int(wd)); !strings.Contains(locals, want) {
+			t.Errorf("infra/locals.tf work_day_num: missing %s", want)
 		}
 	}
 }

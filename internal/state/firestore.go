@@ -27,10 +27,10 @@ func toWire(s *schedule.Span) *wireSpan {
 	return &wireSpan{Start: s.Start, End: s.End, State: string(s.State)}
 }
 
-// parseDesired converts a wire state string to the typed Desired value.
+// parseSpanState converts a wire state string to the typed SpanState value.
 // It returns ok=false for unknown or empty strings, rejecting bad wire data.
-func parseDesired(s string) (schedule.Desired, bool) {
-	d := schedule.Desired(s)
+func parseSpanState(s string) (schedule.SpanState, bool) {
+	d := schedule.SpanState(s)
 	if d != schedule.Awake && d != schedule.Asleep {
 		return "", false
 	}
@@ -41,7 +41,7 @@ func fromWire(w *wireSpan) *schedule.Span {
 	if w == nil {
 		return nil
 	}
-	d, ok := parseDesired(w.State)
+	d, ok := parseSpanState(w.State)
 	if !ok {
 		return nil
 	}
@@ -49,8 +49,7 @@ func fromWire(w *wireSpan) *schedule.Span {
 }
 
 type wireDoc struct {
-	Wake      *wireSpan `firestore:"wake_override"`
-	Sleep     *wireSpan `firestore:"sleep_override"`
+	Sleep     *wireSpan `firestore:"scheduled_sleep"`
 	Hold      *wireSpan `firestore:"hold"`
 	UpdatedBy string    `firestore:"updated_by"`
 	UpdatedAt time.Time `firestore:"updated_at"`
@@ -121,7 +120,6 @@ func (f *Firestore) Load(ctx context.Context) (*Document, error) {
 		return nil, fmt.Errorf("decoding state: %w", err)
 	}
 	return &Document{
-		Wake:      fromWire(wd.Wake),
 		Sleep:     fromWire(wd.Sleep),
 		Hold:      fromWire(wd.Hold),
 		UpdatedBy: wd.UpdatedBy,
@@ -132,7 +130,6 @@ func (f *Firestore) Load(ctx context.Context) (*Document, error) {
 // Save writes the document, replacing any existing one.
 func (f *Firestore) Save(ctx context.Context, doc *Document) error {
 	wd := wireDoc{
-		Wake:      toWire(doc.Wake),
 		Sleep:     toWire(doc.Sleep),
 		Hold:      toWire(doc.Hold),
 		UpdatedBy: f.updater,
@@ -144,8 +141,9 @@ func (f *Firestore) Save(ctx context.Context, doc *Document) error {
 	return nil
 }
 
-// Clear removes all overrides and holds by deleting the state document so the
-// reconciler's garbage collector does not leave a stale empty document.
+// Clear removes the scheduled sleep and keep-awake hold by deleting the state
+// document so the reconciler's garbage collector does not leave a stale empty
+// document.
 func (f *Firestore) Clear(ctx context.Context) error {
 	_, err := f.ref().Delete(ctx)
 	if err != nil && status.Code(err) != codes.NotFound {

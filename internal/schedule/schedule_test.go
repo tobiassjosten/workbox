@@ -1,8 +1,15 @@
 package schedule
 
 import (
+	"fmt"
+	"os"
+	"regexp"
+	"slices"
+	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func mustSchedule(t *testing.T) Schedule {
@@ -14,7 +21,16 @@ func mustSchedule(t *testing.T) Schedule {
 	return sc
 }
 
-// at builds a local Stockholm instant for the given date and time.
+func mustDisabled(t *testing.T) Schedule {
+	t.Helper()
+	sc, err := Disabled("Europe/Stockholm")
+	if err != nil {
+		t.Fatalf("Disabled: %v", err)
+	}
+	return sc
+}
+
+// at builds an instant in the schedule's timezone for the given date and time.
 func at(t *testing.T, sc Schedule, y int, m time.Month, d, h, min int) time.Time {
 	t.Helper()
 	return time.Date(y, m, d, h, min, 0, 0, sc.Loc)
@@ -50,319 +66,371 @@ func TestParseDayTime(t *testing.T) {
 	}
 }
 
-func TestNewValidatesOrder(t *testing.T) {
-	if _, err := New("23:00", "06:00", "Europe/Stockholm"); err == nil {
-		t.Error("New: expected error when wake is after sleep")
-	}
-	if _, err := New("06:00", "23:00", "Nowhere/Nowhere"); err == nil {
-		t.Error("New: expected error for bad timezone")
+// The errors name full config key paths so a user can grep their YAML for them
+// (see the ledger decision).
+func TestNewValidates(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		build   func() error
+		wantKey string
+	}{
+		{"start after end", func() error { _, err := New("23:00", "06:00", "Europe/Stockholm"); return err },
+			"schedule.working_hours.start"},
+		{"bad start", func() error { _, err := New("nope", "23:00", "Europe/Stockholm"); return err },
+			"schedule.working_hours.start"},
+		{"bad end", func() error { _, err := New("06:00", "nope", "Europe/Stockholm"); return err },
+			"schedule.working_hours.end"},
+		{"bad timezone", func() error { _, err := New("06:00", "23:00", "Nowhere/Nowhere"); return err },
+			"schedule.timezone"},
+		{"bad timezone, disabled", func() error { _, err := Disabled("Nowhere/Nowhere"); return err },
+			"schedule.timezone"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.build()
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if !strings.Contains(err.Error(), tc.wantKey) {
+				t.Errorf("error = %v, want it to name %s", err, tc.wantKey)
+			}
+		})
 	}
 }
 
-func TestBaselineNormalDay(t *testing.T) {
+func TestWithinWorkingHours(t *testing.T) {
 	sc := mustSchedule(t)
 	for _, tc := range []struct {
 		h, m int
-		want Desired
+		want bool
 	}{
-		{0, 0, Asleep},
-		{5, 59, Asleep},
-		{6, 0, Awake},
-		{12, 0, Awake},
-		{22, 59, Awake},
-		{23, 0, Asleep},
-		{23, 30, Asleep},
+		{0, 0, false},
+		{5, 59, false},
+		{6, 0, true},
+		{12, 0, true},
+		{22, 59, true},
+		{23, 0, false},
+		{23, 30, false},
 	} {
-		got := sc.Baseline(at(t, sc, 2026, time.June, 15, tc.h, tc.m))
+		got := sc.WithinWorkingHours(at(t, sc, 2026, time.June, 15, tc.h, tc.m))
 		if got != tc.want {
-			t.Errorf("Baseline(%02d:%02d) = %v, want %v", tc.h, tc.m, got, tc.want)
+			t.Errorf("WithinWorkingHours(%02d:%02d) = %v, want %v", tc.h, tc.m, got, tc.want)
 		}
 	}
-}
-
-func TestNextTransitionNormalDay(t *testing.T) {
-	sc := mustSchedule(t)
-	now := at(t, sc, 2026, time.June, 15, 9, 0) // awake
-	tr, ok := sc.NextTransition(now, Overrides{})
-	if !ok {
-		t.Fatal("expected a transition")
-	}
-	want := at(t, sc, 2026, time.June, 15, 23, 0)
-	if !tr.At.Equal(want) || tr.To != Asleep {
-		t.Errorf("NextTransition = %v -> %v, want %v -> asleep", tr.At, tr.To, want)
+	// A disabled schedule is never within working hours.
+	dis := mustDisabled(t)
+	if dis.WithinWorkingHours(at(t, dis, 2026, time.June, 15, 12, 0)) {
+		t.Error("disabled schedule should never be within working hours")
 	}
 }
 
-func TestEarlyWakeOverride(t *testing.T) {
-	sc := mustSchedule(t)
-	// Evening; next baseline wake is tomorrow 06:00. Request 05:00.
-	now := at(t, sc, 2026, time.June, 15, 20, 0)
-	sp, ok := sc.WakeOverride(now, DayTime{5, 0})
-	if !ok {
-		t.Fatal("WakeOverride returned ok=false unexpectedly")
+func TestWorkingHoursWeekdaysOnly(t *testing.T) {
+	// 07:00–17:00 on weekdays only.
+	sc, err := New("07:00", "17:00", "Europe/Stockholm",
+		time.Monday, time.Tuesday, time.Wednesday, time.Thursday, time.Friday)
+	if err != nil {
+		t.Fatal(err)
 	}
-	wantStart := at(t, sc, 2026, time.June, 16, 5, 0)
-	wantEnd := at(t, sc, 2026, time.June, 16, 6, 0)
-	if !sp.Start.Equal(wantStart) || !sp.End.Equal(wantEnd) || sp.State != Awake {
-		t.Fatalf("early wake span = %+v, want [%v,%v) awake", sp, wantStart, wantEnd)
+	// 2026-06-15 is a Monday; 2026-06-13 a Saturday, 2026-06-14 a Sunday.
+	if !sc.WithinWorkingHours(at(t, sc, 2026, time.June, 15, 12, 0)) {
+		t.Error("Monday noon should be within working hours")
 	}
-	ov := Overrides{Wake: &sp}
-	// At 05:30 the VM should be awake because of the override.
-	if got := sc.Desired(at(t, sc, 2026, time.June, 16, 5, 30), ov); got != Awake {
-		t.Errorf("Desired at 05:30 = %v, want awake", got)
+	if sc.WithinWorkingHours(at(t, sc, 2026, time.June, 13, 12, 0)) {
+		t.Error("Saturday noon should be outside working hours (weekday-only)")
 	}
-	// Future day unaffected: at 05:30 two days later, still asleep.
-	if got := sc.Desired(at(t, sc, 2026, time.June, 17, 5, 30), ov); got != Asleep {
-		t.Errorf("Desired next day 05:30 = %v, want asleep", got)
+	if sc.WithinWorkingHours(at(t, sc, 2026, time.June, 14, 12, 0)) {
+		t.Error("Sunday noon should be outside working hours (weekday-only)")
 	}
-}
-
-func TestLateWakeOverride(t *testing.T) {
-	sc := mustSchedule(t)
-	now := at(t, sc, 2026, time.June, 15, 20, 0)
-	sp, ok := sc.WakeOverride(now, DayTime{8, 30})
-	if !ok {
-		t.Fatal("WakeOverride returned ok=false unexpectedly")
-	}
-	wantStart := at(t, sc, 2026, time.June, 16, 6, 0)
-	wantEnd := at(t, sc, 2026, time.June, 16, 8, 30)
-	if !sp.Start.Equal(wantStart) || !sp.End.Equal(wantEnd) || sp.State != Asleep {
-		t.Fatalf("late wake span = %+v, want [%v,%v) asleep", sp, wantStart, wantEnd)
-	}
-	ov := Overrides{Wake: &sp}
-	// At 07:00 the VM should still be asleep (delayed wake).
-	if got := sc.Desired(at(t, sc, 2026, time.June, 16, 7, 0), ov); got != Asleep {
-		t.Errorf("Desired at 07:00 = %v, want asleep", got)
-	}
-	// At 09:00 it is awake.
-	if got := sc.Desired(at(t, sc, 2026, time.June, 16, 9, 0), ov); got != Awake {
-		t.Errorf("Desired at 09:00 = %v, want awake", got)
+	// Outside the time window on a weekday is also outside.
+	if sc.WithinWorkingHours(at(t, sc, 2026, time.June, 15, 18, 0)) {
+		t.Error("Monday 18:00 is past the window")
 	}
 }
 
-func TestWakeOverrideFarInputResolvesForward(t *testing.T) {
-	sc := mustSchedule(t)
-	// Late evening; next baseline wake is tomorrow 06:00. A far-from-transition
-	// request (20:00) must resolve forward, never to a span that starts in the
-	// past or is already active now (which would force an unexpected state).
-	now := at(t, sc, 2026, time.June, 15, 22, 0)
-	sp, ok := sc.WakeOverride(now, DayTime{20, 0})
-	if !ok {
-		t.Fatal("WakeOverride returned ok=false unexpectedly")
+func TestAutoSuspendWeekend(t *testing.T) {
+	sc, err := New("07:00", "17:00", "Europe/Stockholm",
+		time.Monday, time.Tuesday, time.Wednesday, time.Thursday, time.Friday)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if sp.Start.Before(now) {
-		t.Errorf("span starts in the past: start=%v now=%v", sp.Start, now)
+	// Saturday noon, idle past timeout: no working-hours protection → suspend.
+	sat := at(t, sc, 2026, time.June, 13, 12, 0)
+	if got := sc.AutoSuspend(sat, Spans{}, Activity{LastActive: sat.Add(-time.Hour)}, 30*time.Minute); !got.Suspend || got.Reason != ReasonIdle {
+		t.Errorf("weekend idle: got %+v, want suspend idle", got)
 	}
-	if sp.Active(now) {
-		t.Errorf("override should not be active at now=%v: span=%+v", now, sp)
-	}
-	// Resolves to the next 20:00 (tomorrow), delaying the 06:00 baseline wake.
-	wantEnd := at(t, sc, 2026, time.June, 16, 20, 0)
-	if !sp.End.Equal(wantEnd) || sp.State != Asleep {
-		t.Errorf("far wake span = %+v, want end %v asleep", sp, wantEnd)
+	// Monday noon, idle: protected by working hours.
+	mon := at(t, sc, 2026, time.June, 15, 12, 0)
+	if got := sc.AutoSuspend(mon, Spans{}, Activity{LastActive: mon.Add(-time.Hour)}, 30*time.Minute); got.Suspend || got.Reason != ReasonWorkingHours {
+		t.Errorf("weekday within hours: got %+v, want no-suspend working-hours", got)
 	}
 }
 
-func TestWakeOverrideNoOpWhenAtBaseline(t *testing.T) {
+func TestAutoSuspend(t *testing.T) {
 	sc := mustSchedule(t)
-	// Requesting the exact baseline wake time (06:00) yields no override.
-	now := at(t, sc, 2026, time.June, 15, 20, 0)
-	if _, ok := sc.WakeOverride(now, DayTime{6, 0}); ok {
-		t.Error("WakeOverride at baseline wake time should return ok=false")
+	const idle = 30 * time.Minute
+
+	// Reference instants.
+	noon := at(t, sc, 2026, time.June, 15, 12, 0)   // within working hours
+	night := at(t, sc, 2026, time.June, 15, 23, 30) // outside working hours
+
+	holdAwake := &Span{Start: night.Add(-time.Hour), End: night.Add(time.Hour), State: Awake}
+	holdNoon := &Span{Start: noon.Add(-time.Hour), End: noon.Add(time.Hour), State: Awake}
+	sleepNow := &Span{Start: noon.Add(-time.Minute), End: noon.Add(time.Hour), State: Asleep}
+	sleepNight := &Span{Start: night.Add(-time.Minute), End: night.Add(time.Hour), State: Asleep}
+	// Spans whose State doesn't match their slot (e.g. left over from an older
+	// wire model) must be ignored.
+	holdAsleep := &Span{Start: night.Add(-time.Hour), End: night.Add(time.Hour), State: Asleep}
+	sleepAwake := &Span{Start: noon.Add(-time.Minute), End: noon.Add(time.Hour), State: Awake}
+
+	for _, tc := range []struct {
+		name        string
+		now         time.Time
+		spans       Spans
+		act         Activity
+		idle        time.Duration
+		wantSuspend bool
+		wantReason  string
+	}{
+		{
+			name: "within working hours, idle, still protected",
+			now:  noon, act: Activity{LastActive: noon.Add(-2 * time.Hour)}, idle: idle,
+			wantSuspend: false, wantReason: ReasonWorkingHours,
+		},
+		{
+			name: "one-off scheduled sleep beats working hours",
+			now:  noon, spans: Spans{Sleep: sleepNow}, act: Activity{LastActive: noon}, idle: idle,
+			wantSuspend: true, wantReason: ReasonScheduledSleep,
+		},
+		{
+			name: "one-off scheduled sleep beats a keep-awake hold",
+			now:  noon, spans: Spans{Sleep: sleepNow, Hold: holdNoon}, act: Activity{LastActive: noon}, idle: idle,
+			wantSuspend: true, wantReason: ReasonScheduledSleep,
+		},
+		{
+			name: "scheduled sleep with awake state is ignored",
+			now:  noon, spans: Spans{Sleep: sleepAwake}, act: Activity{LastActive: noon}, idle: idle,
+			wantSuspend: false, wantReason: ReasonWorkingHours,
+		},
+		{
+			name: "keep-awake hold inhibits suspend outside hours",
+			now:  night, spans: Spans{Hold: holdAwake}, act: Activity{LastActive: night.Add(-2 * time.Hour)}, idle: idle,
+			wantSuspend: false, wantReason: ReasonKeepAwake,
+		},
+		{
+			name: "hold with asleep state is ignored",
+			now:  night, spans: Spans{Hold: holdAsleep}, act: Activity{LastActive: night.Add(-2 * time.Hour)}, idle: idle,
+			wantSuspend: true, wantReason: ReasonIdle,
+		},
+		{
+			name: "scheduled sleep outside hours beats recent activity",
+			now:  night, spans: Spans{Sleep: sleepNight}, act: Activity{LastActive: night}, idle: idle,
+			wantSuspend: true, wantReason: ReasonScheduledSleep,
+		},
+		{
+			name: "outside hours, recently active",
+			now:  night, act: Activity{LastActive: night.Add(-10 * time.Minute)}, idle: idle,
+			wantSuspend: false, wantReason: ReasonActive,
+		},
+		{
+			name: "outside hours, idle past timeout",
+			now:  night, act: Activity{LastActive: night.Add(-31 * time.Minute)}, idle: idle,
+			wantSuspend: true, wantReason: ReasonIdle,
+		},
+		{
+			name: "outside hours, idle exactly at timeout",
+			now:  night, act: Activity{LastActive: night.Add(-idle)}, idle: idle,
+			wantSuspend: true, wantReason: ReasonIdle,
+		},
+		{
+			name: "outside hours, idle shutdown disabled",
+			now:  night, act: Activity{LastActive: night.Add(-2 * time.Hour)}, idle: 0,
+			wantSuspend: false, wantReason: ReasonIdleDisabled,
+		},
+		{
+			name: "outside hours, nothing known, fails safe to suspend",
+			now:  night, idle: idle,
+			wantSuspend: true, wantReason: ReasonNoActivity,
+		},
+		{
+			name: "freshly booted, no activity yet: boot grace",
+			now:  night, act: Activity{LastStart: night.Add(-5 * time.Minute)}, idle: idle,
+			wantSuspend: false, wantReason: ReasonBootGrace,
+		},
+		{
+			name: "booted after the last activity: boot grace",
+			now:  night, act: Activity{LastActive: night.Add(-2 * time.Hour), LastStart: night.Add(-5 * time.Minute)}, idle: idle,
+			wantSuspend: false, wantReason: ReasonBootGrace,
+		},
+		{
+			name: "boot grace exactly at timeout, no activity",
+			now:  night, act: Activity{LastStart: night.Add(-idle)}, idle: idle,
+			wantSuspend: true, wantReason: ReasonNoActivity,
+		},
+		{
+			name: "boot grace over, stale activity from before the boot",
+			now:  night, act: Activity{LastActive: night.Add(-3 * time.Hour), LastStart: night.Add(-time.Hour)}, idle: idle,
+			wantSuspend: true, wantReason: ReasonIdle,
+		},
+		{
+			name: "activity slightly in the future (clock skew) counts as active",
+			now:  night, act: Activity{LastActive: night.Add(MaxActivitySkew)}, idle: idle,
+			wantSuspend: false, wantReason: ReasonActive,
+		},
+		{
+			name: "far-future activity is ignored",
+			now:  night, act: Activity{LastActive: night.Add(MaxActivitySkew + time.Second)}, idle: idle,
+			wantSuspend: true, wantReason: ReasonNoActivity,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sc.AutoSuspend(tc.now, tc.spans, tc.act, tc.idle)
+			if got.Suspend != tc.wantSuspend || got.Reason != tc.wantReason {
+				t.Errorf("AutoSuspend = %+v, want {Suspend:%v Reason:%q}", got, tc.wantSuspend, tc.wantReason)
+			}
+		})
 	}
 }
 
-func TestSleepOverrideNoOpWhenAtBaseline(t *testing.T) {
-	sc := mustSchedule(t)
-	// Requesting the exact baseline sleep time (23:00) yields no override.
-	now := at(t, sc, 2026, time.June, 15, 15, 0)
-	if _, ok := sc.SleepOverride(now, DayTime{23, 0}); ok {
-		t.Error("SleepOverride at baseline sleep time should return ok=false")
+// TestSpanBoundaries pins the half-open [Start, End) semantics the reconciler
+// mirrors (startS <= now and now < endS).
+func TestSpanBoundaries(t *testing.T) {
+	start := time.Date(2026, time.June, 15, 20, 0, 0, 0, time.UTC)
+	sp := &Span{Start: start, End: start.Add(time.Hour), State: Awake}
+	if !sp.Active(sp.Start) {
+		t.Error("span should be active at its start")
 	}
-}
-
-func TestEarlySleepOverride(t *testing.T) {
-	sc := mustSchedule(t)
-	// Afternoon; next baseline sleep is tonight 23:00. Request 20:00.
-	now := at(t, sc, 2026, time.June, 15, 15, 0)
-	sp, ok := sc.SleepOverride(now, DayTime{20, 0})
-	if !ok {
-		t.Fatal("SleepOverride returned ok=false unexpectedly")
+	if sp.Active(sp.Start.Add(-time.Nanosecond)) {
+		t.Error("span should not be active before its start")
 	}
-	wantStart := at(t, sc, 2026, time.June, 15, 20, 0)
-	wantEnd := at(t, sc, 2026, time.June, 15, 23, 0)
-	if !sp.Start.Equal(wantStart) || !sp.End.Equal(wantEnd) || sp.State != Asleep {
-		t.Fatalf("early sleep span = %+v, want [%v,%v) asleep", sp, wantStart, wantEnd)
+	if sp.Active(sp.End) {
+		t.Error("span should not be active at its end")
 	}
-	ov := Overrides{Sleep: &sp}
-	if got := sc.Desired(at(t, sc, 2026, time.June, 15, 21, 0), ov); got != Asleep {
-		t.Errorf("Desired at 21:00 = %v, want asleep", got)
-	}
-	// Future day unaffected.
-	if got := sc.Desired(at(t, sc, 2026, time.June, 16, 21, 0), ov); got != Awake {
-		t.Errorf("Desired next day 21:00 = %v, want awake", got)
-	}
-}
-
-func TestLateSleepOverridePastMidnight(t *testing.T) {
-	sc := mustSchedule(t)
-	// Evening; extend tonight past midnight to 01:30 tomorrow.
-	now := at(t, sc, 2026, time.June, 15, 21, 0)
-	sp, ok := sc.SleepOverride(now, DayTime{1, 30})
-	if !ok {
-		t.Fatal("SleepOverride returned ok=false unexpectedly")
-	}
-	wantStart := at(t, sc, 2026, time.June, 15, 23, 0)
-	wantEnd := at(t, sc, 2026, time.June, 16, 1, 30)
-	if !sp.Start.Equal(wantStart) || !sp.End.Equal(wantEnd) || sp.State != Awake {
-		t.Fatalf("late sleep span = %+v, want [%v,%v) awake", sp, wantStart, wantEnd)
-	}
-	ov := Overrides{Sleep: &sp}
-	// 00:30 after midnight: still awake because of the override.
-	if got := sc.Desired(at(t, sc, 2026, time.June, 16, 0, 30), ov); got != Awake {
-		t.Errorf("Desired at 00:30 = %v, want awake", got)
-	}
-	// 02:00: override elapsed, back to baseline asleep.
-	if got := sc.Desired(at(t, sc, 2026, time.June, 16, 2, 0), ov); got != Asleep {
-		t.Errorf("Desired at 02:00 = %v, want asleep", got)
-	}
-}
-
-func TestCurrentTimeAfterMidnightSleepOverride(t *testing.T) {
-	sc := mustSchedule(t)
-	// It is already 00:30, having stayed up; the override runs to 01:30.
-	now := at(t, sc, 2026, time.June, 16, 0, 30)
-	sp := Span{
-		Start: at(t, sc, 2026, time.June, 15, 23, 0),
-		End:   at(t, sc, 2026, time.June, 16, 1, 30),
-		State: Awake,
-	}
-	ov := Overrides{Sleep: &sp}
-	if got := sc.Desired(now, ov); got != Awake {
-		t.Errorf("Desired at 00:30 = %v, want awake", got)
-	}
-	tr, ok := sc.NextTransition(now, ov)
-	if !ok || tr.To != Asleep || !tr.At.Equal(sp.End) {
-		t.Errorf("NextTransition = %+v ok=%v, want asleep at %v", tr, ok, sp.End)
-	}
-}
-
-func TestOverrideExpiry(t *testing.T) {
-	sc := mustSchedule(t)
-	sp := Span{
-		Start: at(t, sc, 2026, time.June, 15, 20, 0),
-		End:   at(t, sc, 2026, time.June, 15, 23, 0),
-		State: Asleep,
-	}
-	if sp.Expired(at(t, sc, 2026, time.June, 15, 22, 0)) {
-		t.Error("span should not be expired at 22:00")
-	}
-	if !sp.Expired(at(t, sc, 2026, time.June, 15, 23, 0)) {
+	if !sp.Expired(sp.End) {
 		t.Error("span should be expired at its end")
 	}
-	// An expired override does not affect a later evaluation.
-	ov := Overrides{Sleep: &sp}
-	if got := sc.Desired(at(t, sc, 2026, time.June, 16, 21, 0), ov); got != Awake {
-		t.Errorf("Desired after expiry = %v, want awake", got)
+	if sp.Expired(sp.End.Add(-time.Nanosecond)) {
+		t.Error("span should not be expired just before its end")
 	}
 }
 
-func TestManualWakeHold(t *testing.T) {
+func TestAutoSuspendDisabledWorkingHours(t *testing.T) {
+	sc := mustDisabled(t)
+	const idle = 30 * time.Minute
+	now := at(t, sc, 2026, time.June, 15, 12, 0)
+	// With no working hours, midday behaves like any other time: idle governs.
+	if got := sc.AutoSuspend(now, Spans{}, Activity{LastActive: now.Add(-time.Hour)}, idle); !got.Suspend || got.Reason != ReasonIdle {
+		t.Errorf("disabled+idle: got %+v, want suspend idle", got)
+	}
+	if got := sc.AutoSuspend(now, Spans{}, Activity{LastActive: now.Add(-time.Minute)}, idle); got.Suspend || got.Reason != ReasonActive {
+		t.Errorf("disabled+active: got %+v, want no-suspend active", got)
+	}
+}
+
+func TestKeepAwakeHold(t *testing.T) {
 	sc := mustSchedule(t)
-	// 01:00, baseline asleep. `workbox wake` should establish a hold.
-	now := at(t, sc, 2026, time.June, 15, 1, 0)
-	sp, ok := sc.WakeHold(now, Overrides{})
-	if !ok {
-		t.Fatal("expected a hold when baseline is asleep")
+	now := at(t, sc, 2026, time.June, 15, 23, 30)
+	sp := sc.KeepAwakeHold(now, 2*time.Hour)
+	if sp.State != Awake || !sp.End.Equal(now.Add(2*time.Hour)) {
+		t.Fatalf("KeepAwakeHold = %+v, want awake for 2h", sp)
 	}
-	// Hold runs until the next scheduled sleep (23:00 today).
-	wantEnd := at(t, sc, 2026, time.June, 15, 23, 0)
-	if !sp.End.Equal(wantEnd) || sp.State != Awake {
-		t.Fatalf("wake hold = %+v, want end %v awake", sp, wantEnd)
+	if !sp.Active(now.Add(time.Hour)) {
+		t.Error("hold should be active within its window")
 	}
-	ov := Overrides{Hold: &sp}
-	if got := sc.Desired(at(t, sc, 2026, time.June, 15, 3, 0), ov); got != Awake {
-		t.Errorf("Desired at 03:00 with hold = %v, want awake", got)
-	}
-	// No hold needed when already awake.
-	if _, ok := sc.WakeHold(at(t, sc, 2026, time.June, 15, 10, 0), Overrides{}); ok {
-		t.Error("no hold should be needed at 10:00")
+	if sp.Active(now.Add(3 * time.Hour)) {
+		t.Error("hold should have expired after its window")
 	}
 }
 
-func TestManualSleepHold(t *testing.T) {
+func TestScheduledSleepToday(t *testing.T) {
 	sc := mustSchedule(t)
-	// 22:00, baseline awake. `workbox sleep` should hold asleep until next wake.
-	now := at(t, sc, 2026, time.June, 15, 22, 0)
-	sp, ok := sc.SleepHold(now, Overrides{})
-	if !ok {
-		t.Fatal("expected a hold when baseline is awake")
+	// Afternoon; a one-off sleep at 20:00 should fire tonight.
+	now := at(t, sc, 2026, time.June, 15, 15, 0)
+	sp := sc.ScheduledSleep(now, DayTime{20, 0})
+	wantStart := at(t, sc, 2026, time.June, 15, 20, 0)
+	wantEnd := at(t, sc, 2026, time.June, 16, 6, 0) // next working-hours start
+	if !sp.Start.Equal(wantStart) || !sp.End.Equal(wantEnd) || sp.State != Asleep {
+		t.Fatalf("ScheduledSleep = %+v, want [%v,%v) asleep", sp, wantStart, wantEnd)
 	}
-	wantEnd := at(t, sc, 2026, time.June, 16, 6, 0)
-	if !sp.End.Equal(wantEnd) || sp.State != Asleep {
-		t.Fatalf("sleep hold = %+v, want end %v asleep", sp, wantEnd)
+	// Before 20:00 it is not active; from 20:00 it forces suspend.
+	if sp.Active(at(t, sc, 2026, time.June, 15, 19, 0)) {
+		t.Error("scheduled sleep should not be active before its time")
 	}
-	ov := Overrides{Hold: &sp}
-	if got := sc.Desired(at(t, sc, 2026, time.June, 15, 22, 30), ov); got != Asleep {
-		t.Errorf("Desired at 22:30 with hold = %v, want asleep", got)
-	}
-	if _, ok := sc.SleepHold(at(t, sc, 2026, time.June, 15, 2, 0), Overrides{}); ok {
-		t.Error("no hold should be needed at 02:00")
+	if got := sc.AutoSuspend(at(t, sc, 2026, time.June, 15, 20, 30), Spans{Sleep: &sp}, Activity{LastActive: now}, 30*time.Minute); !got.Suspend {
+		t.Errorf("scheduled sleep should force suspend at 20:30, got %+v", got)
 	}
 }
 
-func TestHoldExpiry(t *testing.T) {
-	sc := mustSchedule(t)
-	now := at(t, sc, 2026, time.June, 15, 1, 0)
-	sp := sc.KeepAwakeHold(now, 3*time.Hour)
-	ov := Overrides{Hold: &sp}
-	if got := sc.Desired(at(t, sc, 2026, time.June, 15, 3, 0), ov); got != Awake {
-		t.Errorf("Desired inside keep-awake = %v, want awake", got)
-	}
-	// After the hold expires (04:00), baseline (still <06:00) is asleep.
-	if got := sc.Desired(at(t, sc, 2026, time.June, 15, 5, 0), ov); got != Asleep {
-		t.Errorf("Desired after keep-awake = %v, want asleep", got)
-	}
-}
-
-func TestHoldBeatsOverride(t *testing.T) {
+// A sleep requested for the current minute starts now, not tomorrow.
+func TestScheduledSleepAtCurrentTime(t *testing.T) {
 	sc := mustSchedule(t)
 	now := at(t, sc, 2026, time.June, 15, 20, 0)
-	// Early-sleep override says asleep at 21:00...
-	sleep := Span{
-		Start: at(t, sc, 2026, time.June, 15, 20, 0),
-		End:   at(t, sc, 2026, time.June, 15, 23, 0),
-		State: Asleep,
+	if sp := sc.ScheduledSleep(now, DayTime{20, 0}); !sp.Start.Equal(now) {
+		t.Errorf("ScheduledSleep start = %v, want %v (now)", sp.Start, now)
 	}
-	// ...but a keep-awake hold overrides it.
-	hold := sc.KeepAwakeHold(now, 2*time.Hour)
-	ov := Overrides{Sleep: &sleep, Hold: &hold}
-	if got := sc.Desired(at(t, sc, 2026, time.June, 15, 21, 0), ov); got != Awake {
-		t.Errorf("Desired at 21:00 = %v, want awake (hold beats override)", got)
+}
+
+func TestScheduledSleepRollsToTomorrow(t *testing.T) {
+	sc := mustSchedule(t)
+	// It is already 21:00; a one-off sleep at 20:00 is in the past, so it rolls
+	// to tomorrow rather than resolving backward.
+	now := at(t, sc, 2026, time.June, 15, 21, 0)
+	sp := sc.ScheduledSleep(now, DayTime{20, 0})
+	wantStart := at(t, sc, 2026, time.June, 16, 20, 0)
+	if !sp.Start.Equal(wantStart) {
+		t.Errorf("ScheduledSleep start = %v, want %v (tomorrow)", sp.Start, wantStart)
+	}
+	if sp.Start.Before(now) {
+		t.Errorf("scheduled sleep must not start in the past: %v", sp.Start)
+	}
+}
+
+func TestScheduledSleepRollsOneDayInScheduleZone(t *testing.T) {
+	sc := mustSchedule(t) // Europe/Stockholm
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 23:30 Stockholm on Sat 31 Oct 2026, seen from a laptop in New York the
+	// evening before its DST fall-back (a 25h day there). Rolling "tomorrow" in
+	// the laptop's zone would land on 2 Nov in Stockholm and skip 1 Nov.
+	now := at(t, sc, 2026, time.October, 31, 23, 30).In(ny)
+	sp := sc.ScheduledSleep(now, DayTime{20, 0})
+	if want := at(t, sc, 2026, time.November, 1, 20, 0); !sp.Start.Equal(want) {
+		t.Errorf("ScheduledSleep start = %v, want %v", sp.Start, want)
+	}
+	if want := at(t, sc, 2026, time.November, 2, 6, 0); !sp.End.Equal(want) {
+		t.Errorf("ScheduledSleep end = %v, want %v", sp.End, want)
+	}
+}
+
+func TestScheduledSleepDisabledWindow(t *testing.T) {
+	sc := mustDisabled(t)
+	now := at(t, sc, 2026, time.June, 15, 15, 0)
+	sp := sc.ScheduledSleep(now, DayTime{20, 0})
+	wantStart := at(t, sc, 2026, time.June, 15, 20, 0)
+	if !sp.Start.Equal(wantStart) || !sp.End.Equal(wantStart.Add(8*time.Hour)) {
+		t.Fatalf("ScheduledSleep (disabled) = %+v, want [%v,+8h)", sp, wantStart)
 	}
 }
 
 // DST: Sweden springs forward 2026-03-29 (02:00 -> 03:00) and falls back
-// 2026-10-25 (03:00 -> 02:00). Baseline wake/sleep must land on the correct
+// 2026-10-25 (03:00 -> 02:00). Working-hours boundaries must land on the correct
 // wall-clock times regardless.
 func TestDSTSpringForward(t *testing.T) {
 	sc := mustSchedule(t)
-	// On the spring-forward day, 06:00 exists and is CEST (+02:00).
-	wake := sc.on(at(t, sc, 2026, time.March, 29, 12, 0), sc.Wake)
-	_, offset := wake.Zone()
+	start := sc.on(at(t, sc, 2026, time.March, 29, 12, 0), sc.Start)
+	_, offset := start.Zone()
 	if offset != 2*3600 {
-		t.Errorf("spring-forward wake offset = %d, want +7200", offset)
+		t.Errorf("spring-forward start offset = %d, want +7200", offset)
 	}
-	if got := sc.Baseline(at(t, sc, 2026, time.March, 29, 7, 0)); got != Awake {
-		t.Errorf("Baseline 07:00 on DST day = %v, want awake", got)
+	if !sc.WithinWorkingHours(at(t, sc, 2026, time.March, 29, 7, 0)) {
+		t.Error("07:00 on DST day should be within working hours")
 	}
 }
 
 func TestDSTFallBack(t *testing.T) {
 	sc := mustSchedule(t)
-	// The day before fall-back is still CEST; the day after is CET (+01:00).
-	before := sc.on(at(t, sc, 2026, time.October, 24, 12, 0), sc.Wake)
-	after := sc.on(at(t, sc, 2026, time.October, 26, 12, 0), sc.Wake)
+	before := sc.on(at(t, sc, 2026, time.October, 24, 12, 0), sc.Start)
+	after := sc.on(at(t, sc, 2026, time.October, 26, 12, 0), sc.Start)
 	_, offBefore := before.Zone()
 	_, offAfter := after.Zone()
 	if offBefore != 2*3600 {
@@ -371,32 +439,217 @@ func TestDSTFallBack(t *testing.T) {
 	if offAfter != 1*3600 {
 		t.Errorf("post-fallback offset = %d, want +3600", offAfter)
 	}
-	// A sleep override from 23:00 on the 25th to 01:30 on the 26th: both ends
-	// are still CEST (the repeated hour is 02:00-03:00, after 01:30), so the
-	// real elapsed time equals the wall-clock 2h30m.
-	now := at(t, sc, 2026, time.October, 25, 21, 0)
-	sp, _ := sc.SleepOverride(now, DayTime{1, 30})
-	if got := sp.End.Sub(sp.Start); got != 2*time.Hour+30*time.Minute {
-		t.Errorf("fall-back span (pre-repeat) duration = %v, want 2h30m", got)
+}
+
+func TestNextWorkingHoursStart(t *testing.T) {
+	sc := mustSchedule(t)
+	// Midday inside the window: the next start is tomorrow morning.
+	now := at(t, sc, 2026, time.June, 15, 12, 0)
+	if start, ok := sc.NextWorkingHoursStart(now); !ok || !start.Equal(at(t, sc, 2026, time.June, 16, 6, 0)) {
+		t.Errorf("NextWorkingHoursStart = %v ok=%v, want 2026-06-16 06:00", start, ok)
 	}
-	// A span that crosses the 03:00 fall-back on the 25th picks up the extra
-	// real hour: 01:00 CEST to 04:00 CET is 3 wall-clock hours but 4 real hours.
-	crossStart := time.Date(2026, time.October, 25, 1, 0, 0, 0, sc.Loc)
-	crossEnd := time.Date(2026, time.October, 25, 4, 0, 0, 0, sc.Loc)
-	if got := crossEnd.Sub(crossStart); got != 4*time.Hour {
-		t.Errorf("fall-back crossing duration = %v, want 4h real", got)
+	// Weekday-only window: from Friday evening the next start is Monday.
+	wk, err := New("06:00", "23:00", "Europe/Stockholm",
+		time.Monday, time.Tuesday, time.Wednesday, time.Thursday, time.Friday)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fri := at(t, wk, 2026, time.June, 19, 23, 30)
+	if start, ok := wk.NextWorkingHoursStart(fri); !ok || !start.Equal(at(t, wk, 2026, time.June, 22, 6, 0)) {
+		t.Errorf("NextWorkingHoursStart(Fri) = %v ok=%v, want Mon 2026-06-22 06:00", start, ok)
+	}
+	// Single-day window, asked after that day's start: the next start is exactly
+	// seven days out — the far end of the scan.
+	mon, err := New("06:00", "23:00", "Europe/Stockholm", time.Monday)
+	if err != nil {
+		t.Fatal(err)
+	}
+	monNoon := at(t, mon, 2026, time.June, 15, 12, 0)
+	nextMon := at(t, mon, 2026, time.June, 22, 6, 0)
+	if start, ok := mon.NextWorkingHoursStart(monNoon); !ok || !start.Equal(nextMon) {
+		t.Errorf("NextWorkingHoursStart(Mon-only, Mon noon) = %v ok=%v, want %v", start, ok, nextMon)
+	}
+	if sp := mon.ScheduledSleep(monNoon, DayTime{20, 0}); !sp.End.Equal(nextMon) {
+		t.Errorf("ScheduledSleep end (Mon-only) = %v, want %v", sp.End, nextMon)
+	}
+	// Disabled schedule reports no start.
+	if _, ok := mustDisabled(t).NextWorkingHoursStart(now); ok {
+		t.Error("disabled schedule should report no working-hours start")
 	}
 }
 
-func TestScheduleQueryHelpers(t *testing.T) {
-	sc := mustSchedule(t)
-	now := at(t, sc, 2026, time.June, 15, 12, 0)
-	nw, ok := sc.NextWake(now, Overrides{})
-	if !ok || !nw.Equal(at(t, sc, 2026, time.June, 16, 6, 0)) {
-		t.Errorf("NextWake = %v ok=%v, want 2026-06-16 06:00", nw, ok)
+// TestReconcilerMirrorsEngine checks the reconciler template (which cannot run
+// locally) against the engine it mirrors: every Reason is an action it can
+// return, its clock-skew bound matches MaxActivitySkew, and its idle
+// comparisons match AutoSuspend's.
+func TestReconcilerMirrorsEngine(t *testing.T) {
+	raw, err := os.ReadFile("../../infra/reconcile.yaml.tftpl")
+	if err != nil {
+		t.Fatal(err)
 	}
-	ns, ok := sc.NextSleep(now, Overrides{})
-	if !ok || !ns.Equal(at(t, sc, 2026, time.June, 15, 23, 0)) {
-		t.Errorf("NextSleep = %v ok=%v, want 2026-06-15 23:00", ns, ok)
+	src := string(raw)
+	for _, r := range []string{
+		ReasonScheduledSleep, ReasonKeepAwake, ReasonWorkingHours, ReasonIdleDisabled,
+		ReasonActive, ReasonBootGrace, ReasonNoActivity, ReasonIdle,
+	} {
+		if want := `action: "` + r + `"`; !strings.Contains(src, want) {
+			t.Errorf("infra/reconcile.yaml.tftpl has no %s", want)
+		}
+	}
+	if want := fmt.Sprintf("maxSkewS: %d", int(MaxActivitySkew/time.Second)); !strings.Contains(src, want) {
+		t.Errorf("infra/reconcile.yaml.tftpl has no %s (MaxActivitySkew)", want)
+	}
+	// The idle comparisons AutoSuspend mirrors. (The reconciler's "not-running"
+	// verdict is pinned against cli.ReasonNotRunning in internal/cli.)
+	for _, want := range []string{
+		"now - lastActiveS < idleMin * 60",
+		"now - startedS < idleMin * 60",
+		// The skew clamp, the template half of schedule.FutureActivity.
+		"lastActiveS > now + maxSkewS",
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("infra/reconcile.yaml.tftpl no longer contains %s", want)
+		}
+	}
+}
+
+// assertDecisionOrder pins the reconciler's precedence: the ordered switch
+// targets of each decision step, and the ordered step list of main (several
+// steps carry no next: and fall through to the one listed after them, so their
+// order is part of the flow). Mirrors schedule.AutoSuspend.
+func assertDecisionOrder(t *testing.T, doc map[string]any) {
+	t.Helper()
+	steps, ok := doc["main"].(map[string]any)["steps"].([]any)
+	if !ok {
+		t.Fatal("main.steps is not a list; did the template layout change?")
+	}
+	var names []string
+	byName := map[string]map[string]any{}
+	for _, item := range steps {
+		for name, body := range item.(map[string]any) {
+			names = append(names, name)
+			if m, ok := body.(map[string]any); ok {
+				byName[name] = m
+			}
+		}
+	}
+	wantOrder := []string{
+		"init", "getInstance", "status", "guardRunning", "notRunning", "readState",
+		"fields", "evalSleep", "evalHold", "weekdayInit", "withinHours",
+		"decideScheduled", "decideProtected", "keptKeepAwake", "keptWorkingHours",
+		"keptIdleDisabled", "readActivity", "idleInputs", "activityScan",
+		"activityHave", "activityParse", "activityClamp", "activityFuture",
+		"startedPick", "startedParse", "decideIdle", "keptBootGrace", "keptActive",
+		"markScheduledSleep", "markNoActivity", "markIdle", "suspendVm", "waitVmOp",
+		"cleanup",
+	}
+	if !slices.Equal(names, wantOrder) {
+		t.Fatalf("main step order =\n%v\nwant\n%v", names, wantOrder)
+	}
+	// The ordered switch targets encode the precedence itself.
+	for step, want := range map[string][]string{
+		"decideScheduled": {"markScheduledSleep"},
+		"decideProtected": {"keptKeepAwake", "keptWorkingHours", "keptIdleDisabled"},
+		"decideIdle":      {"keptActive", "keptBootGrace", "markNoActivity"},
+	} {
+		cases, ok := byName[step]["switch"].([]any)
+		if !ok {
+			t.Errorf("%s has no switch; did the template layout change?", step)
+			continue
+		}
+		var got []string
+		for _, c := range cases {
+			got = append(got, c.(map[string]any)["next"].(string))
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("%s switch targets = %v, want %v", step, got, want)
+		}
+	}
+}
+
+// TestReconcilerRendersAndRoutes renders the reconciler template with sample
+// values, parses it as YAML and checks that every next: names a real step and
+// every call: to a local subworkflow names a real one, so a broken route fails
+// here rather than at `make tf-apply`.
+func TestReconcilerRendersAndRoutes(t *testing.T) {
+	raw, err := os.ReadFile("../../infra/reconcile.yaml.tftpl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sample := map[string]string{
+		"work_start_min": "360", "work_end_min": "1380", "idle_min": "30",
+		"work_days_map": `{"1": true}`,
+	}
+	const escaped = "\x00"
+	src := strings.ReplaceAll(string(raw), "$${", escaped)
+	src = regexp.MustCompile(`\$\{(\w+)\}`).ReplaceAllStringFunc(src, func(m string) string {
+		if v, ok := sample[m[2:len(m)-1]]; ok {
+			return v
+		}
+		return "sample"
+	})
+	src = strings.ReplaceAll(src, escaped, "${")
+
+	var doc map[string]any
+	if err := yaml.Unmarshal([]byte(src), &doc); err != nil {
+		t.Fatalf("rendered reconciler is not valid YAML: %v", err)
+	}
+	steps := map[string]bool{}
+	var nexts, calls []string
+	var walk func(v any)
+	walk = func(v any) {
+		switch v := v.(type) {
+		case map[string]any:
+			for k, child := range v {
+				if k == "steps" {
+					if list, ok := child.([]any); ok {
+						for _, item := range list {
+							if m, ok := item.(map[string]any); ok {
+								for name := range m {
+									steps[name] = true
+								}
+							}
+						}
+					}
+				}
+				if k == "next" {
+					if s, ok := child.(string); ok {
+						nexts = append(nexts, s)
+					}
+				}
+				// The template's own subworkflows are plain identifiers; connectors
+				// and standard-library calls are dotted.
+				if k == "call" {
+					if s, ok := child.(string); ok && !strings.Contains(s, ".") {
+						calls = append(calls, s)
+					}
+				}
+				walk(child)
+			}
+		case []any:
+			for _, child := range v {
+				walk(child)
+			}
+		}
+	}
+	walk(doc)
+	assertDecisionOrder(t, doc)
+	if len(nexts) == 0 {
+		t.Fatal("found no next: routes; did the template layout change?")
+	}
+	// "end" ends the workflow; "continue"/"break" are the loop keywords.
+	keywords := map[string]bool{"end": true, "continue": true, "break": true}
+	for _, n := range nexts {
+		if !steps[n] && !keywords[n] {
+			t.Errorf("next: %q names no step", n)
+		}
+	}
+	if len(calls) == 0 {
+		t.Fatal("found no subworkflow calls; did the template layout change?")
+	}
+	for _, c := range calls {
+		if _, ok := doc[c]; !ok {
+			t.Errorf("call: %q names no subworkflow", c)
+		}
 	}
 }

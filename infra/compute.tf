@@ -59,6 +59,11 @@ resource "google_compute_instance" "workbox" {
     block-project-ssh-keys = "true"
     enable-oslogin         = "false"
 
+    # Let the guest write its own guest attributes (the activity signal). This is
+    # authorized by the metadata server for the instance itself and needs no extra
+    # SA role; the reconciler reads it with compute.instances.getGuestAttributes.
+    enable-guest-attributes = "TRUE"
+
     # The single-use Tailscale enrollment key, in its own entry so the startup
     # script can stay Terraform-managed while this one is ignored after create
     # (see lifecycle below). The script reads it only when not yet enrolled.
@@ -72,6 +77,7 @@ resource "google_compute_instance" "workbox" {
       timezone         = local.timezone
       ts_hostname      = local.ts_hostname
       ts_authkey_attr  = local.ts_authkey_attr
+      activity_key     = local.activity_key
     })
   }
 
@@ -82,11 +88,11 @@ resource "google_compute_instance" "workbox" {
   ]
 
   # NOTE: the startup-script is intentionally Terraform-managed (not ignored) so
-  # provisioning changes reach the VM on the next `terraform apply`. It carries
-  # no secret: the enrollment key lives in its own metadata entry, which is
-  # ignored after create. A replaced key (any change to its arguments, or a
-  # -replace) therefore never lands in a running, already enrolled VM's
-  # metadata, where anything on the VM could read and use it.
+  # provisioning changes — e.g. the activity emitter — reach the VM on the next
+  # `terraform apply`. It carries no secret: the enrollment key lives in its own
+  # metadata entry, which is ignored after create. A replaced key (any change to
+  # its arguments, or a -replace) therefore never lands in a running, already
+  # enrolled VM's metadata, where anything on the VM could read and use it.
   #
   # Metadata changes apply in place, but GCE runs a startup-script only at BOOT:
   # an updated script takes effect on the instance's next boot (a reboot, or a

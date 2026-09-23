@@ -9,27 +9,28 @@ decoupled from how you *connect* to it.
 ```
 CONTROL PLANE (power / state)                CONNECTIVITY PLANE (your session)
 
-  workbox CLI ────┐                            your laptop
-                  │                                 │
-  Cloud Scheduler │  Google Cloud APIs             Tailscale (private tailnet)
-        │         ▼                                 │
-        ▼   ┌───────────────┐                       ▼
-   Workflow │ Compute Engine│                     OpenSSH  ── key-only, no
-   (reconciler)│  get/start/ │                       │        public ingress
-        │    │ resume/suspend│                       ▼
-        ▼    └───────────────┘                   workbox VM
-   Firestore (tiny state doc)                        │
-                                                      ▼
+  workbox CLI ──────▶ Compute Engine         your laptop
+    │   get/start/resume/suspend                    │
+    ▼                                               ▼
+  Firestore (tiny state doc)                 Tailscale (private tailnet)
+    ▲                                               │
+    │                                               ▼
+  Workflow (reconciler) ──▶ Compute Engine   OpenSSH  ── key-only, no
+    ▲     ▲                 get/suspend             │      public ingress
+    │     │                                         ▼
+    │   guest attribute ◀── VM emitter       workbox VM
+    │   (workbox/last_active)                       │
+  Cloud Scheduler (1/min)                           ▼
                                              Herdr server + panes
-                                                      │
+                                                    │
                                              Claude Code sessions
 ```
 
 - **Control plane** — the Go CLI and a GCP Workflow call Google Cloud APIs
   directly (through the official Go client libraries and Workflows connectors;
-  never by shelling out to `gcloud`). They inspect the instance, start/resume/
-  suspend it, and read/write a small Firestore document. Cloud Scheduler triggers
-  the Workflow once per minute.
+  never by shelling out to `gcloud`). They inspect the instance, suspend it
+  (only the CLI starts/resumes it), and read/write a small Firestore document.
+  Cloud Scheduler triggers the Workflow once per minute.
 - **Connectivity plane** — your machine reaches the VM only over Tailscale, then
   ordinary OpenSSH, then Herdr. The VM has a public egress IP for outbound
   package installs and Tailscale coordination, but **no inbound firewall rule**.
@@ -42,10 +43,10 @@ The two planes never cross: you can control power while the VM is unreachable
 ```
 Terraform (infra/)             Go CLI + Workflow (runtime)
 ─────────────────────          ───────────────────────────
-APIs, VPC, subnet              wake / sleep / status
-VM, boot + data disks          wake-at / sleep-at / keep-awake
-snapshot policy                cancel-override / schedule
-IAM (3 SAs + operator role)    reconciler transitions
+APIs, VPC, subnet              wake / sleep [HH:MM] / status
+VM, boot + data disks          keep-awake / cancel / schedule
+snapshot policy                reconciler idle-suspend
+IAM (3 SAs + operator role)    Firestore hold / scheduled sleep
 Firestore database             Firestore state document contents
 Workflow + Scheduler
 Tailscale key / policy
@@ -91,29 +92,35 @@ auto-transitions the instance to `TERMINATED` and the preserved memory is lost
 ## Scheduling architecture
 
 ```
-Cloud Scheduler  ──(every minute, OAuth)──▶  Workflow reconciler
-                                                   │
-                     reads baseline schedule ◀─────┤
-                     reads override/hold spans ◀────┼──  Firestore state doc
+Cloud Scheduler  ──(every minute, OAuth)──▶  Workflow reconciler (suspend-only)
+                                                    │
                      gets instance status ◀─────────┤
-                     performs one transition ────────▶  Compute Engine API
+                     reads hold / scheduled sleep ◀─┼──  Firestore state doc
+                     reads last-active ◀────────────┼──  guest attribute (VM emitter)
+                     suspends if idle & unprotected ▶  Compute Engine API
 ```
 
 A GCP **Workflow** is the reconciler rather than an always-on `workboxd` daemon:
-there is nothing to keep running, patch, or pay for between ticks. Each run:
+there is nothing to keep running, patch, or pay for between ticks. Waking is
+always manual (the CLI), so the reconciler **only ever suspends** — it never
+resumes or starts. Each run:
 
-1. gets the current time in the configured IANA timezone via `time.format`
+1. gets the instance status; does nothing unless it is `RUNNING`;
+2. gets the current time in the configured IANA timezone via `time.format`
    (DST-correct, no manual offsets);
-2. derives the baseline desired state from the normal schedule;
-3. reads override/hold spans from Firestore;
-4. applies them in precedence order (below);
-5. gets the instance status;
-6. performs only the single transition required (resume/start/suspend), or
-   nothing;
-7. deletes the state document once every span has expired.
+3. reads the keep-awake hold and scheduled-sleep spans from Firestore;
+4. a scheduled sleep forces a suspend; a keep-awake hold or being within working
+   hours inhibits it;
+5. otherwise, when idle shutdown is enabled, reads the last-active guest attribute
+   the VM emits and suspends once idle ≥ the timeout, counting from the later of
+   that value and the instance's `lastStartTimestamp` (a boot grace for every
+   start path); a far-future or non-numeric value is ignored, and with neither
+   known it fails safe toward suspend;
+6. deletes the state document once every span has expired (so cleanup only
+   happens while the VM is running).
 
-It is idempotent: if the state already matches the desired state, it does
-nothing.
+It is idempotent: an already-suspended VM, or one that should stay up, is left
+untouched.
 
 ### Approximate cost of the reconciler
 
@@ -131,29 +138,32 @@ while `RUNNING`) and disk/snapshot storage.
 ## Operational state document
 
 One tiny Firestore document (collection `workbox`, id = instance name) holds the
-scheduling overrides. Its field layout is the contract between
+optional operational spans. Its field layout is the contract between
 `internal/state/firestore.go` and `infra/reconcile.yaml.tftpl`:
 
 ```
-wake_override:  { start: <timestamp>, end: <timestamp>, state: "awake"|"asleep" }
-sleep_override: { start: <timestamp>, end: <timestamp>, state: "awake"|"asleep" }
-hold:           { start: <timestamp>, end: <timestamp>, state: "awake"|"asleep" }
-updated_by:     <string>
-updated_at:     <timestamp>
+scheduled_sleep: { start: <timestamp>, end: <timestamp>, state: "asleep" }
+hold:            { start: <timestamp>, end: <timestamp>, state: "awake" }   # keep-awake / wake grace
+updated_by:      <string>
+updated_at:      <timestamp>
 ```
 
-Each is an optional half-open span `[start, end)`. **Precedence, lowest to
-highest:**
+Each is an optional half-open span `[start, end)`. **Precedence, highest to
+lowest:**
 
 ```
-baseline recurring schedule
-    < one-workday override (wake_override / sleep_override)
-    < manual hold
+scheduled sleep (scheduled_sleep, forces suspend even in working hours)
+    > keep-awake hold
+    > working hours
+    > idle shutdown
 ```
 
-Overrides are one-shot: they cover exactly one boundary and expire when `now`
-passes their `end`. See the schedule engine in `internal/schedule/schedule.go`
-and the worked examples in [operations.md](operations.md).
+Spans expire when `now` passes their `end`; the reconciler deletes the document
+once all present spans have expired (on a tick where the VM is running). The
+last-active signal is **not** in this document — it travels as a guest
+attribute (`workbox/last_active`) the VM emits, keeping the VM's least-privilege
+SA out of Firestore. See the engine in `internal/schedule/schedule.go` and the
+day-to-day behavior in [operations.md](operations.md#wake-manually-sleep-on-idle).
 
 ## Persistent development disk
 
