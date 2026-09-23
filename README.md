@@ -356,9 +356,23 @@ others do not.
 The data disk is protected with Terraform `prevent_destroy` and `auto_delete=false`,
 so it is not deleted when the instance is replaced. To rebuild the VM in place:
 
-```sh
-terraform apply -replace=google_compute_instance.workbox
-```
+1. Set `gcp.deletion_protection: false` in your config and run `make tf-apply`
+   (a protected instance cannot be replaced).
+2. Remove the old machine in the Tailscale admin console, so the new one can
+   register under the same hostname.
+3. Replace the instance and the enrollment key:
+
+   ```sh
+   terraform -chdir=infra apply -replace=google_compute_instance.workbox \
+     -replace=tailscale_tailnet_key.bootstrap \
+     -var config_file=$HOME/.config/workbox/config.yaml
+   ```
+
+4. Set `gcp.deletion_protection` back to `true` and run `make tf-apply`.
+
+The enrollment key is replaced with the instance because the old one is
+single-use and already consumed: a new VM given it could not join the tailnet.
+
 
 Alternatively, detach and reattach the disk. Either way, **`/work` survives**. See
 [docs/operations.md](docs/operations.md) for the exact detach/reattach steps.
@@ -375,8 +389,10 @@ restore, create a new disk from a snapshot and reattach it. See
   traffic. All SSH is over Tailscale.
 - **Key-only SSH.** The startup script hardens SSH to public-key authentication.
 - **Least-privilege service accounts.** The VM holds no admin credentials.
-- **Single-use Tailscale key.** The tagged enrollment key is single-use and lives
-  only in git-ignored Terraform state.
+- **Single-use Tailscale key.** The tagged enrollment key is single-use; it lives
+  in git-ignored Terraform state and in its own instance metadata entry, where it
+  is useless once consumed. Terraform never pushes a replacement key to a running
+  VM.
 - **No secrets in git.** Tailscale OAuth credentials are supplied via environment
   variables; Claude login is interactive on the VM.
 
