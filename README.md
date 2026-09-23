@@ -134,6 +134,7 @@ machine:
   ssh_public_key_file: ~/.ssh/id_ed25519.pub   # ~ expanded; PUBLIC key only
   # optional:
   # data_mount: /work
+  # swap_gb: 4                       # swapfile size in GB; 0 disables (default 4)
 
 tailscale:
   hostname: workbox

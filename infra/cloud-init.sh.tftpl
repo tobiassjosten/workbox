@@ -21,6 +21,69 @@ apt-get update -y
 apt-get install -y \
   git curl ca-certificates build-essential jq ripgrep tmux unzip gnupg lsb-release
 
+# --- Swap (memory cushion) --------------------------------------------------
+# A swapfile turns a memory spike into slowness instead of an OOM-killed session
+# on a small VM. Size comes from config (machine.swap_gb); 0 disables. Lives on
+# the boot disk (survives reboot via fstab). Converges each boot: a size change
+# rebuilds the file and 0 removes it. The file is built aside and moved into
+# place so a failure (e.g. a full boot disk) never leaves a broken /swapfile, and
+# any failure is non-fatal so it can't block the rest of provisioning. dd (not
+# fallocate) so swapon never trips over a sparse file.
+LOG "swap"
+SWAP_GB="${swap_gb}"
+SWAPFILE="/swapfile"
+# Capture rather than pipe to grep -q, which can SIGPIPE swapon under pipefail
+# and make an already-active swapfile look inactive.
+swap_active() {
+  local active_swaps="$(swapon --show=NAME --noheadings 2>/dev/null)"
+  printf '%s\n' "$${active_swaps}" | grep -qx "$${SWAPFILE}"
+}
+# Never unlink a swapfile the kernel still holds: its space would be reclaimed
+# only on reboot, and setup_swap would build a second one beside it. swapoff can
+# genuinely fail (ENOMEM when swap cannot be paged back in), so report it and
+# leave the working swapfile alone until the next boot.
+remove_swap() {
+  swapoff "$${SWAPFILE}" 2>/dev/null || true
+  if swap_active; then
+    LOG "swapoff $${SWAPFILE} failed; leaving it in place"
+    return 1
+  fi
+  rm -f "$${SWAPFILE}" "$${SWAPFILE}.tmp"
+  sed -i "\#^$${SWAPFILE} #d" /etc/fstab
+}
+setup_swap() {
+  if [ "$${SWAP_GB}" -le 0 ]; then
+    remove_swap || return 1
+    LOG "swap disabled (machine.swap_gb=0)"
+    return 0
+  fi
+  local want=$(( SWAP_GB * 1024 * 1024 * 1024 ))
+  if [ -f "$${SWAPFILE}" ] && [ "$(stat -c %s "$${SWAPFILE}")" -ne "$${want}" ]; then
+    LOG "resizing swapfile to $${SWAP_GB}G"
+    remove_swap || return 1
+  fi
+  if [ ! -f "$${SWAPFILE}" ]; then
+    LOG "creating $${SWAP_GB}G swapfile at $${SWAPFILE}"
+    rm -f "$${SWAPFILE}.tmp"
+    dd if=/dev/zero of="$${SWAPFILE}.tmp" bs=1M count="$(( SWAP_GB * 1024 ))" status=none || return 1
+    chmod 600 "$${SWAPFILE}.tmp" || return 1
+    mkswap "$${SWAPFILE}.tmp" >/dev/null || return 1
+    mv "$${SWAPFILE}.tmp" "$${SWAPFILE}" || return 1
+  fi
+  if ! swap_active; then
+    swapon "$${SWAPFILE}" || return 1
+  fi
+  if ! grep -q "^$${SWAPFILE} " /etc/fstab; then
+    echo "$${SWAPFILE} none swap sw 0 0" >> /etc/fstab || return 1
+  fi
+}
+# set -e does not apply inside a function called as an `if` condition, which is
+# why every step above returns explicitly on failure.
+if ! setup_swap; then
+  rm -f "$${SWAPFILE}.tmp"
+  LOG "swap setup failed (non-fatal)"
+fi
+
 # --- Persistent development disk -------------------------------------------
 LOG "development disk"
 if [ -b "$${DATA_DEV}" ]; then

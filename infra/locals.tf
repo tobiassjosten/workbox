@@ -34,6 +34,11 @@ locals {
   ssh_public_key = trimspace(file(pathexpand(local.cfg.machine.ssh_public_key_file)))
   data_mount     = coalesce(try(local.cfg.machine.data_mount, ""), "/work")
 
+  # Swapfile size (GB) the VM creates on boot so memory spikes degrade into
+  # slowness instead of OOM-killing sessions. 0 disables. Consumed only here (the
+  # Go CLI merely validates machine.swap_gb); coalesce so a YAML null also defaults.
+  swap_gb = coalesce(try(local.cfg.machine.swap_gb, null), 4)
+
   ts_hostname      = local.cfg.tailscale.hostname
   ts_tag           = try(local.cfg.tailscale.tag, "tag:${local.name}")
   ts_user          = try(local.cfg.tailscale.user, "")

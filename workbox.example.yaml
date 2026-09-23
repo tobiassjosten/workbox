@@ -43,6 +43,12 @@ machine:
   ssh_public_key_file: ~/.ssh/id_ed25519.pub
   # Where the persistent development disk is mounted. Optional; defaults to /work.
   data_mount: /work
+  # Swapfile size in GB the VM creates on boot, so a memory spike degrades into
+  # slowness instead of OOM-killing your session. Optional; defaults to 4. Set 0
+  # to disable. Applied by `make tf-apply` but takes effect on the VM's next boot
+  # (`sudo reboot` on the VM, or stop the instance via the Console/gcloud, then
+  # `workbox wake`; `workbox sleep` only suspends and does not re-run it).
+  swap_gb: 4
 
 tailscale:
   # Tailscale MagicDNS hostname the node registers as.

@@ -68,6 +68,7 @@ resource "google_compute_instance" "workbox" {
       linux_user       = local.linux_user
       data_device_name = local.data_device_name
       data_mount       = local.data_mount
+      swap_gb          = local.swap_gb
       timezone         = local.timezone
       ts_hostname      = local.ts_hostname
       ts_authkey_attr  = local.ts_authkey_attr
@@ -102,6 +103,13 @@ resource "google_compute_instance" "workbox" {
     precondition {
       condition     = local.ts_authkey_attr == "workbox-ts-authkey"
       error_message = "local.ts_authkey_attr must match the ignore_changes literal in compute.tf, or a replaced enrollment key would reach the running VM."
+    }
+
+    # Mirror internal/config.Validate: a swapfile is a whole number of GB and
+    # cannot be negative (0 disables).
+    precondition {
+      condition     = local.swap_gb >= 0 && floor(local.swap_gb) == local.swap_gb
+      error_message = "machine.swap_gb (${local.swap_gb}) must be a whole number: 0 (disabled) or positive."
     }
   }
 }

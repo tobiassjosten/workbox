@@ -58,6 +58,12 @@ type Machine struct {
 	SSHPublicKeyFile string `yaml:"ssh_public_key_file"`
 	// DataMount is where the persistent development disk is mounted.
 	DataMount string `yaml:"data_mount"`
+	// SwapGB sizes a swapfile the VM creates on boot so memory spikes degrade
+	// into slowness instead of OOM-killing interactive sessions. 0 disables it.
+	// Consumed only by Terraform (infra/locals.tf -> cloud-init); the Go CLI only
+	// validates it. Pointer so an absent key defaults while an explicit 0
+	// disables. Default 4 (applied in infra/locals.tf).
+	SwapGB *int `yaml:"swap_gb"`
 }
 
 // Tailscale holds tailnet identity and policy configuration.
@@ -203,6 +209,9 @@ func (c *Config) Validate() error {
 	}
 	if c.GCP.DataDiskGB <= 0 {
 		return fmt.Errorf("gcp.data_disk_gb must be positive")
+	}
+	if c.Machine.SwapGB != nil && *c.Machine.SwapGB < 0 {
+		return fmt.Errorf("machine.swap_gb must not be negative")
 	}
 	// Building the schedule validates timezone, HH:MM format and wake<sleep.
 	if _, err := c.Schedule.Build(); err != nil {

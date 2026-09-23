@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -160,5 +161,12 @@ func TestTailscaleKeyEntryIsIgnored(t *testing.T) {
 	want := regexp.MustCompile(`ignore_changes\s*=\s*\[metadata\["` + regexp.QuoteMeta(m[1]) + `"\]\]`)
 	if !want.MatchString(readInfra(t, "compute.tf")) {
 		t.Errorf("infra/compute.tf does not ignore_changes metadata[%q]", m[1])
+	}
+}
+
+func TestValidateNegativeSwapRejected(t *testing.T) {
+	cfg := strings.Replace(minimal, "  linux_user: developer\n", "  linux_user: developer\n  swap_gb: -1\n", 1)
+	if _, err := Parse([]byte(cfg)); err == nil {
+		t.Fatal("expected error for negative machine.swap_gb")
 	}
 }
