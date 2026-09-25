@@ -213,7 +213,10 @@ func runSleep(ctx context.Context, a *cli.App, args []string) error {
 
 // appCmd adapts an App method into a cobra RunE that wires config, compute and
 // state, and cleans up afterward.
-func appCmd(cfgPath *string, fn func(ctx context.Context, a *cli.App, args []string) error) func(*cobra.Command, []string) error {
+func appCmd(
+	cfgPath *string,
+	fn func(ctx context.Context, a *cli.App, args []string) error,
+) func(*cobra.Command, []string) error {
 	return func(_ *cobra.Command, args []string) error {
 		ctx, cancel := signalContext()
 		defer cancel()
@@ -323,7 +326,14 @@ func wakeAndWait(ctx context.Context, cfg *config.Config) error {
 // and how to dig further. A cancelled wait (Ctrl-C) passes through with no hint,
 // as does a VM the Compute API reports in any state but RUNNING — an unreadable
 // state still gets the hint, since that is when the user needs it most.
-func diagnoseUnreachable(ctx context.Context, w io.Writer, comp compute.Compute, target ssh.Target, waitTimeout time.Duration, waitErr error) error {
+func diagnoseUnreachable(
+	ctx context.Context,
+	w io.Writer,
+	comp compute.Compute,
+	target ssh.Target,
+	waitTimeout time.Duration,
+	waitErr error,
+) error {
 	if !errors.Is(waitErr, context.DeadlineExceeded) {
 		return waitErr
 	}
@@ -461,7 +471,8 @@ func runDoctor(ctx context.Context, cfgPath string, wake bool) error {
 		deps.Compute = comp
 		deps.Activity = comp
 	}
-	results := append(wakeResult, doctor.Run(ctx, deps)...)
+	results := wakeResult
+	results = append(results, doctor.Run(ctx, deps)...)
 	printResults(os.Stdout, results)
 	if doctor.Failed(results) {
 		return doctor.ErrChecksFailed

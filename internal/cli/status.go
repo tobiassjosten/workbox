@@ -448,6 +448,8 @@ func (a *App) Schedule(ctx context.Context) error {
 	a.printWorkingHours(now)
 	a.printIdle()
 	a.printHoldAndSleep(doc, now, withNone)
-	a.printf("\nWake is manual (`workbox` / `workbox wake`). To change working hours or\nthe idle timeout, edit the schedule block in your config and re-run\n`make tf-apply`.\n")
+	a.printf("\nWake is manual (`workbox` / `workbox wake`). To change working hours or\n" +
+		"the idle timeout, edit the schedule block in your config and re-run\n" +
+		"`make tf-apply`.\n")
 	return nil
 }

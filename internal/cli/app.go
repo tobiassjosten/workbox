@@ -180,7 +180,8 @@ func (a *App) Sleep(ctx context.Context) error {
 	// if the read failed: the document is only used for the report below.
 	doc, loadErr := a.activeDoc(ctx, a.now())
 	if err := a.Store.Clear(ctx); err != nil {
-		return fmt.Errorf("workbox is asleep, but any keep-awake hold or scheduled sleep could not be cleared (run `workbox cancel` to retry): %w", err)
+		return fmt.Errorf("workbox is asleep, but any keep-awake hold or scheduled sleep "+
+			"could not be cleared (run `workbox cancel` to retry): %w", err)
 	}
 	if loadErr != nil {
 		a.printClearedUnknown(loadErr)
@@ -220,7 +221,8 @@ func (a *App) SleepAt(ctx context.Context, hhmm string) error {
 	if replaced != nil {
 		a.printf("Replaced the scheduled sleep at %s.\n", a.fmtTime(replaced.Start))
 	}
-	a.printf("Scheduled sleep: workbox suspends at %s and is held asleep until %s; it never wakes on its own — run `workbox wake` to resume.\n",
+	a.printf("Scheduled sleep: workbox suspends at %s and is held asleep until %s; "+
+		"it never wakes on its own — run `workbox wake` to resume.\n",
 		a.fmtTime(span.Start), a.fmtTime(span.End))
 	if doc.Hold != nil && doc.Hold.End.After(span.Start) {
 		a.printf("The keep-awake hold until %s stays in place, but the scheduled sleep wins from %s.\n",
@@ -301,7 +303,9 @@ func (a *App) Cancel(ctx context.Context) error {
 // place, since it will still suspend the VM (it wins over a keep-awake hold).
 func (a *App) printPendingSleep(sp *schedule.Span) {
 	if sp != nil {
-		a.printf("Scheduled sleep still set for %s (`workbox cancel` calls it off — and clears any keep-awake hold).\n", a.fmtTime(sp.Start))
+		a.printf("Scheduled sleep still set for %s "+
+			"(`workbox cancel` calls it off — and clears any keep-awake hold).\n",
+			a.fmtTime(sp.Start))
 	}
 }
 
@@ -367,7 +371,7 @@ func normalizeHHMM(s string) string {
 	if len(s) != 4 {
 		return s
 	}
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		if s[i] < '0' || s[i] > '9' {
 			return s
 		}

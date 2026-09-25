@@ -144,7 +144,12 @@ func WaitReachable(ctx context.Context, t Target, connectTimeout, waitTimeout, i
 }
 
 // waitReachable is WaitReachable with the probe injected, for tests.
-func waitReachable(ctx context.Context, t Target, waitTimeout, interval time.Duration, try func(context.Context) error) error {
+func waitReachable(
+	ctx context.Context,
+	t Target,
+	waitTimeout, interval time.Duration,
+	try func(context.Context) error,
+) error {
 	ctx, cancel := context.WithTimeout(ctx, waitTimeout)
 	defer cancel()
 	var lastErr error
@@ -166,7 +171,8 @@ func waitReachable(ctx context.Context, t Target, waitTimeout, interval time.Dur
 				return ctx.Err()
 			}
 			if lastErr != nil {
-				return fmt.Errorf("ssh to %q not reachable within %s (last error: %v): %w", t.Host, waitTimeout, lastErr, context.DeadlineExceeded)
+				return fmt.Errorf("ssh to %q not reachable within %s (last error: %w): %w",
+					t.Host, waitTimeout, lastErr, context.DeadlineExceeded)
 			}
 			return fmt.Errorf("ssh to %q not reachable within %s: %w", t.Host, waitTimeout, context.DeadlineExceeded)
 		case <-timer.C:

@@ -127,12 +127,13 @@ func Run(ctx context.Context, d Deps) []Result {
 	// UNKNOWN" from "we never got an answer", so the skips below do not claim a
 	// state that was never read.
 	state, stateKnown := compute.Unknown, false
-	if d.ComputeErr != nil {
+	switch {
+	case d.ComputeErr != nil:
 		add(Result{Name: "gcp instance", Level: Fail, Detail: d.ComputeErr.Error(),
 			Remedy: "check ADC: gcloud auth application-default login"})
-	} else if d.Compute == nil {
+	case d.Compute == nil:
 		add(Result{Name: "gcp instance", Level: Skip, Detail: "no compute client"})
-	} else {
+	default:
 		s, err := d.Compute.Status(ctx)
 		if err != nil {
 			add(Result{Name: "gcp instance", Level: Fail, Detail: err.Error(),
@@ -149,12 +150,13 @@ func Run(ctx context.Context, d Deps) []Result {
 	// writes it at boot, so the "activity emitter" check below covers the emitter
 	// itself), and is checked even with idle shutdown disabled since
 	// `workbox status` reads the same signal.
-	if d.Activity == nil {
+	switch {
+	case d.Activity == nil:
 		add(Result{Name: "activity signal", Level: Skip, Detail: "no activity client"})
-	} else if state != compute.Running {
+	case state != compute.Running:
 		add(Result{Name: "activity signal", Level: Skip,
 			Detail: instanceStateDetail(state, stateKnown) + "; activity is only reported while RUNNING"})
-	} else {
+	default:
 		add(d.activitySignal(ctx))
 	}
 
@@ -193,7 +195,11 @@ func Run(ctx context.Context, d Deps) []Result {
 	if err := d.runRemote(ctx, d.Target, activityTimerActiveCmd); err != nil {
 		add(Result{Name: "activity emitter", Level: Warn,
 			Detail: "workbox-activity.timer is not active",
-			Remedy: "reboot the VM (`sudo reboot` on it, or stop the instance with the Console or `gcloud compute instances stop`, then `workbox wake`; `workbox sleep` only suspends and does not re-run provisioning) or run `sudo google_metadata_script_runner startup` on it, so activity is reported for `workbox status` and idle-suspend"})
+			Remedy: "reboot the VM (`sudo reboot` on it, or stop the instance with the Console " +
+				"or `gcloud compute instances stop`, then `workbox wake`; `workbox sleep` only " +
+				"suspends and does not re-run provisioning) or run " +
+				"`sudo google_metadata_script_runner startup` on it, so activity is reported " +
+				"for `workbox status` and idle-suspend"})
 	} else if err := d.runRemote(ctx, d.Target, activityServiceFailedCmd); err == nil {
 		// is-failed succeeds only when the unit's last run failed.
 		add(Result{Name: "activity emitter", Level: Warn,
@@ -220,28 +226,36 @@ func (d *Deps) activitySignal(ctx context.Context) Result {
 	t, ok, err := d.Activity.LastActive(ctx)
 	switch {
 	case errors.Is(err, compute.ErrInvalidActivity):
-		return Result{Name: name, Level: Warn, Detail: err.Error() + "; ignored by workbox, so it cannot hold off idle shutdown",
+		return Result{Name: name, Level: Warn,
+			Detail: err.Error() + "; ignored by workbox, so it cannot hold off idle shutdown",
 			Remedy: "something other than the activity emitter wrote the attribute; the emitter's next report overwrites it"}
 	case err != nil:
-		remedy := "retry; if it persists, check your ADC credentials (`gcloud auth application-default login`) and the Compute API's availability for the project"
+		remedy := "retry; if it persists, check your ADC credentials " +
+			"(`gcloud auth application-default login`) and the Compute API's availability for the project"
 		if compute.IsPermissionDenied(err) {
-			remedy = "run `make tf-apply` to update the workboxOperator role (adds compute.instances.getGuestAttributes) and make sure it is granted to you"
+			remedy = "run `make tf-apply` to update the workboxOperator role " +
+				"(adds compute.instances.getGuestAttributes) and make sure it is granted to you"
 		}
 		return Result{Name: name, Level: Warn, Detail: err.Error(), Remedy: remedy}
 	case !ok:
 		// The startup script writes a value at every boot, so a running VM without
 		// one has not run the current provisioning, or its report failed.
-		detail := "no last-active value (the startup script reports one at every boot, so the current provisioning has likely not run since it was applied, or its report failed)"
+		detail := "no last-active value (the startup script reports one at every boot, so the " +
+			"current provisioning has likely not run since it was applied, or its report failed)"
 		if d.Config != nil && d.Config.Schedule.IdleTimeout() > 0 {
 			detail += "; the reconciler counts idle time from the VM's last start"
 		}
 		return Result{Name: name, Level: Warn,
 			Detail: detail,
-			Remedy: "reboot the VM (`sudo reboot` on it) or run `sudo google_metadata_script_runner startup` on it; if it is still missing, check `journalctl -u google-startup-scripts -u workbox-activity.service` for \"activity report failed\" and that the instance has enable-guest-attributes=TRUE"}
+			Remedy: "reboot the VM (`sudo reboot` on it) or run " +
+				"`sudo google_metadata_script_runner startup` on it; if it is still missing, check " +
+				"`journalctl -u google-startup-scripts -u workbox-activity.service` " +
+				"for \"activity report failed\" and that the instance has enable-guest-attributes=TRUE"}
 	case schedule.FutureActivity(t, d.now()):
 		return Result{Name: name, Level: Warn,
 			Detail: "last active " + d.fmtTime(t) + " is in the future; not counted as activity, so idle shutdown still applies",
-			Remedy: "check the VM clock (`timedatectl` on it) and whether anything other than the activity emitter writes the attribute"}
+			Remedy: "check the VM clock (`timedatectl` on it) and whether anything other than " +
+				"the activity emitter writes the attribute"}
 	default:
 		return Result{Name: name, Level: Pass, Detail: "last active " + d.fmtTime(t)}
 	}

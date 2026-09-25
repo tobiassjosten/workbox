@@ -22,8 +22,18 @@ globs: ["**/*.go", "go.mod", "go.sum"]
 - **Errors** are wrapped with `%w` and context (`fmt.Errorf("resuming instance: %w", err)`),
   concise and actionable. Sentinel errors (`ErrUnsupportedState`, `ErrChecksFailed`)
   are compared with `errors.Is`.
-- Keep `gofmt` clean and `golangci-lint` (govet, staticcheck, errcheck,
-  ineffassign, unused) quiet. `make lint` runs it; `make check` includes it.
+- Keep `gofmt` clean and `golangci-lint` quiet. `.golangci.yml` is the source of
+  truth for the enabled set (the defaults plus error, context, prose, test-hygiene
+  and modernization linters); `make lint` runs it and `make check` includes it.
+  **Run it after finishing a change** — a finding is not "pre-existing", the tree
+  is clean.
+- Every carve-out in `.golangci.yml` is commented with why. Add one only when a
+  linter's premise does not fit the code (as `unparam` does not fit test
+  fixtures); never to dodge a real finding, and never with a bare `//nolint`.
+- **Lines stay within 120 columns** (`lll`, enforced outside `_test.go`). Wrap a
+  long signature one parameter per line, and split a long message into adjacent
+  string literals at a sentence or clause break — never shorten the message to
+  fit.
 - Tests are first-class: schedule math, config precedence/parsing, path
   expansion, idempotent wake/sleep, status JSON, cancellation. Table-driven
   where it helps. Do not write flaky time-based tests.

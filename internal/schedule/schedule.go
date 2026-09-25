@@ -149,7 +149,8 @@ func New(start, end, timezone string, days ...time.Weekday) (Schedule, error) {
 		return Schedule{}, fmt.Errorf("schedule.timezone %q: %w", timezone, err)
 	}
 	if minutes(s) >= minutes(e) {
-		return Schedule{}, fmt.Errorf("schedule.working_hours.start (%s) must be earlier in the day than schedule.working_hours.end (%s)", s, e)
+		return Schedule{}, fmt.Errorf("schedule.working_hours.start (%s) must be earlier "+
+			"in the day than schedule.working_hours.end (%s)", s, e)
 	}
 	return Schedule{Enabled: true, Start: s, End: e, Days: days, Loc: loc}, nil
 }
@@ -200,7 +201,7 @@ func (sc Schedule) NextWorkingHoursStart(t time.Time) (time.Time, bool) {
 	// start strictly after t (an empty Days set means every day is active).
 	// Stepping the local calendar date keeps DST-length days from skipping one.
 	local := t.In(sc.Loc)
-	for i := 0; i <= 7; i++ {
+	for i := range 8 {
 		cand := sc.on(local.AddDate(0, 0, i), sc.Start)
 		if cand.After(t) && sc.activeDay(cand) {
 			return cand, true

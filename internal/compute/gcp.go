@@ -237,7 +237,8 @@ func lastActiveFromResp(resp *computepb.GuestAttributes) (time.Time, bool, error
 		// The VM writes this value, so bound what we render (as probeErr does
 		// for ssh stderr) before it reaches a terminal or --json. %q escapes
 		// whatever control characters survive the bound.
-		return time.Time{}, false, fmt.Errorf("guest attribute %s=%q: %w", LastActiveQueryPath, truncate(raw), ErrInvalidActivity)
+		return time.Time{}, false, fmt.Errorf("guest attribute %s=%q: %w",
+			LastActiveQueryPath, truncate(raw), ErrInvalidActivity)
 	}
 	return time.Unix(secs, 0), true, nil
 }

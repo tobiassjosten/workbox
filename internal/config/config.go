@@ -133,7 +133,8 @@ func (w *WorkingHours) Weekdays() ([]time.Weekday, error) {
 	for _, name := range w.Days {
 		wd, ok := weekdayNames[strings.ToLower(strings.TrimSpace(name))]
 		if !ok {
-			return nil, fmt.Errorf("schedule.working_hours.days: unknown day %q (use names like mon, tue or monday, tuesday)", name)
+			return nil, fmt.Errorf("schedule.working_hours.days: unknown day %q "+
+				"(use names like mon, tue or monday, tuesday)", name)
 		}
 		if !slices.Contains(out, wd) {
 			out = append(out, wd)
@@ -342,22 +343,22 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config is missing required fields: %s", strings.Join(missing, ", "))
 	}
 	if c.GCP.BootDiskGB <= 0 {
-		return fmt.Errorf("gcp.boot_disk_gb must be positive")
+		return errors.New("gcp.boot_disk_gb must be positive")
 	}
 	if c.GCP.DataDiskGB <= 0 {
-		return fmt.Errorf("gcp.data_disk_gb must be positive")
+		return errors.New("gcp.data_disk_gb must be positive")
 	}
 	if n := c.Schedule.IdleTimeoutMinutes; n != nil && *n != 0 && *n < minIdleTimeoutMinutes {
 		return fmt.Errorf("schedule.idle_timeout_minutes must be 0 (disabled) or at least %d", minIdleTimeoutMinutes)
 	}
 	if c.Machine.SwapGB != nil && *c.Machine.SwapGB < 0 {
-		return fmt.Errorf("machine.swap_gb must not be negative")
+		return errors.New("machine.swap_gb must not be negative")
 	}
 	if c.SSH.ConnectTimeoutSeconds != nil && *c.SSH.ConnectTimeoutSeconds <= 0 {
-		return fmt.Errorf("ssh.connect_timeout_seconds must be positive")
+		return errors.New("ssh.connect_timeout_seconds must be positive")
 	}
 	if c.SSH.WaitTimeoutSeconds != nil && *c.SSH.WaitTimeoutSeconds <= 0 {
-		return fmt.Errorf("ssh.wait_timeout_seconds must be positive")
+		return errors.New("ssh.wait_timeout_seconds must be positive")
 	}
 	// Day names are checked even for a disabled window, as Terraform does.
 	if _, err := c.Schedule.WorkingHours.Weekdays(); err != nil {

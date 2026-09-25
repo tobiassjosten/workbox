@@ -1,9 +1,42 @@
 # golangci-lint configuration. The default linters (errcheck, govet, ineffassign,
-# staticcheck, unused) run; this file only tunes errcheck so it flags genuinely
-# unchecked errors without the conventional low-value noise.
+# staticcheck, unused) run, plus the set enabled below. Settings only tune
+# errcheck so it flags genuinely unchecked errors without the conventional
+# low-value noise.
 version: "2"
 
 linters:
+  enable:
+    # Line length. Long lines here are almost always a signature or a message
+    # that wants wrapping. Defaults (120 columns, tab = 1 column).
+    - lll
+
+    # Errors. errorlint keeps %w/errors.Is honest, errname keeps sentinels named
+    # ErrX, nilerr catches "err != nil" branches that return nil anyway.
+    - errorlint
+    - errname
+    - nilerr
+
+    # Context must be a parameter, never a struct field.
+    - containedctx
+
+    # Prose. The Remedy/Detail strings and doc comments are user-facing.
+    - misspell
+    - dupword
+
+    # Test hygiene: t.Helper(), t.Context()/t.Setenv, correct t.Parallel().
+    - thelper
+    - tparallel
+    - usetesting
+
+    # Modernization and dead weight.
+    - copyloopvar
+    - intrange
+    - unconvert
+    - unparam
+    - predeclared
+    - perfsprint
+    - gocritic
+
   settings:
     errcheck:
       # Writes to stdout/stderr and test env teardown are best-effort by
@@ -14,3 +47,27 @@ linters:
         - fmt.Fprintf
         - fmt.Fprintln
         - os.Unsetenv
+
+  exclusions:
+    rules:
+      # Tests assert on whole user-facing messages (`want := "..."`) and build
+      # table rows of literals. Both have to read as one unit to be comparable
+      # with the strings they mirror, so line length is not a useful signal here.
+      - path: _test\.go
+        linters:
+          - lll
+
+      # unparam's premise — a parameter that never varies is dead flexibility —
+      # holds for production APIs but not for test fixtures, where the constant
+      # is the point: it asked for the month to be dropped from a date helper,
+      # which only hides which date a case is about. It still guards non-test code.
+      - path: _test\.go
+        linters:
+          - unparam
+
+issues:
+  # Report every finding. The defaults (50 per linter, 3 per identical message)
+  # silently hide the rest, which makes a clean `make check` mean less than it
+  # looks — five identical perfsprint hits were reported as three.
+  max-issues-per-linter: 0
+  max-same-issues: 0

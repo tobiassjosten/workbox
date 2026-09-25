@@ -64,7 +64,7 @@ vet: ## Run go vet
 	go vet ./...
 
 .PHONY: lint
-lint: ## Run golangci-lint (govet, staticcheck, errcheck, ineffassign, unused)
+lint: ## Run golangci-lint (enabled set in .golangci.yml)
 	@command -v golangci-lint >/dev/null 2>&1 || { \
 		echo "golangci-lint not found; install v2:"; \
 		echo "  curl -sSfL https://golangci-lint.run/install.sh | sh -s -- -b \$$(go env GOPATH)/bin v2.13.2"; \

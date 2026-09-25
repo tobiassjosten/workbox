@@ -219,7 +219,8 @@ func (a *App) settleAfterWait(ctx context.Context, top *holdTopUp) {
 	now := a.now()
 	doc, err := a.Store.Load(ctx)
 	if err != nil {
-		a.errPrintf("Could not re-check the keep-awake hold and scheduled sleep (%v); run `workbox schedule` to see where they stand.\n", err)
+		a.errPrintf("Could not re-check the keep-awake hold and scheduled sleep (%v); "+
+			"run `workbox schedule` to see where they stand.\n", err)
 		return
 	}
 	// The pruned view decides what counts as in effect, exactly as the pre-wake
@@ -323,16 +324,19 @@ func (a *App) reportSettleFailure(top *holdTopUp, hold, cancelled *schedule.Span
 		// the recovery rather than a deadline to beat. A future sleep — the
 		// keep-awake reach-over case — still leaves time to head it off.
 		if cancelled.Active(a.now()) {
-			a.errPrintf("The scheduled sleep at %s is in effect and could not be cancelled (%v); it may suspend the VM within the minute — run %s to call it off and bring the VM back.\n",
+			a.errPrintf("The scheduled sleep at %s is in effect and could not be cancelled (%v); "+
+				"it may suspend the VM within the minute — run %s to call it off and bring the VM back.\n",
 				a.fmtTime(cancelled.Start), err, recoverCmd)
 			return
 		}
-		a.errPrintf("The scheduled sleep at %s could not be cancelled (%v), though %s; run %s to call it off before it suspends the VM.\n",
+		a.errPrintf("The scheduled sleep at %s could not be cancelled (%v), though %s; "+
+			"run %s to call it off before it suspends the VM.\n",
 			a.fmtTime(cancelled.Start), err, reason, recoverCmd)
 		return
 	}
 	if hold != nil {
-		a.errPrintf("Could not extend the keep-awake hold (%v); it runs at least as long as reported above — run %s to set it from now.\n",
+		a.errPrintf("Could not extend the keep-awake hold (%v); it runs at least as long as "+
+			"reported above — run %s to set it from now.\n",
 			err, recoverCmd)
 	}
 }
