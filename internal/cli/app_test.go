@@ -50,14 +50,19 @@ func disableIdle(app *App) {
 	app.Cfg.Schedule.IdleTimeoutMinutes = &zero
 }
 
-func localTime(t *testing.T, y int, m time.Month, d, h, min int) time.Time {
+// testYear is the year every test instant falls in; the month and day carry
+// the meaning (weekday, DST side), so repeating it at each call site adds
+// nothing.
+const testYear = 2026
+
+func localTime(t *testing.T, m time.Month, d, h, minute int) time.Time {
 	t.Helper()
 	loc, _ := time.LoadLocation("Europe/Stockholm")
-	return time.Date(y, m, d, h, min, 0, 0, loc)
+	return time.Date(testYear, m, d, h, minute, 0, 0, loc)
 }
 
 func TestWakeSetsGraceHold(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30) // outside working hours
+	now := localTime(t, 6, 15, 23, 30) // outside working hours
 	app, store, buf := testApp(t, compute.Suspended, now)
 	if err := app.Wake(context.Background()); err != nil {
 		t.Fatal(err)
@@ -80,7 +85,7 @@ func TestWakeSetsGraceHold(t *testing.T) {
 }
 
 func TestWakeKeepsLongerHold(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30) // outside working hours
+	now := localTime(t, 6, 15, 23, 30) // outside working hours
 	app, store, buf := testApp(t, compute.Suspended, now)
 	if err := app.KeepAwake(context.Background(), 3*time.Hour); err != nil {
 		t.Fatal(err)
@@ -102,11 +107,11 @@ func TestWakeKeepsLongerHold(t *testing.T) {
 func TestWakeCancelsInEffectScheduledSleep(t *testing.T) {
 	// A scheduled sleep is currently active; waking must clear it so the
 	// reconciler does not immediately re-suspend.
-	now := localTime(t, 2026, 6, 15, 21, 0)
+	now := localTime(t, 6, 15, 21, 0)
 	app, store, buf := testApp(t, compute.Suspended, now)
 	active := &schedule.Span{
 		Start: now.Add(-time.Hour),
-		End:   localTime(t, 2026, 6, 16, 6, 0),
+		End:   localTime(t, 6, 16, 6, 0),
 		State: schedule.Asleep,
 	}
 	if err := store.Save(context.Background(), &state.Document{Sleep: active}); err != nil {
@@ -127,10 +132,10 @@ func TestWakeCancelsInEffectScheduledSleep(t *testing.T) {
 func TestWakeKeepsFutureScheduledSleep(t *testing.T) {
 	// A scheduled sleep set for later today is not in effect yet; waking now must
 	// leave it in place.
-	now := localTime(t, 2026, 6, 15, 15, 0)
+	now := localTime(t, 6, 15, 15, 0)
 	future := &schedule.Span{
-		Start: localTime(t, 2026, 6, 15, 20, 0),
-		End:   localTime(t, 2026, 6, 16, 6, 0),
+		Start: localTime(t, 6, 15, 20, 0),
+		End:   localTime(t, 6, 16, 6, 0),
 		State: schedule.Asleep,
 	}
 	app, store, buf := testApp(t, compute.Suspended, now)
@@ -152,7 +157,7 @@ func TestWakeKeepsFutureScheduledSleep(t *testing.T) {
 }
 
 func TestWakeIdleDisabledNoHold(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
+	now := localTime(t, 6, 15, 23, 30)
 	app, store, _ := testApp(t, compute.Suspended, now)
 	disableIdle(app)
 	if err := app.Wake(context.Background()); err != nil {
@@ -170,7 +175,7 @@ func TestWakeIdleDisabledNoHold(t *testing.T) {
 // Wake and KeepAwake persist before resuming, so a store failure must leave the
 // VM alone rather than running with no hold recorded.
 func TestWakeAndKeepAwakeStoreFailureDoesNotWake(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
+	now := localTime(t, 6, 15, 23, 30)
 	for _, tc := range []struct {
 		name string
 		run  func(*App) error
@@ -194,7 +199,7 @@ func TestWakeAndKeepAwakeStoreFailureDoesNotWake(t *testing.T) {
 }
 
 func TestWakeClearsDocumentLeftWithoutSpans(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
+	now := localTime(t, 6, 15, 23, 30)
 	app, store, _ := testApp(t, compute.Suspended, now)
 	disableIdle(app)
 	doc, _ := store.Load(context.Background())
@@ -213,7 +218,7 @@ func TestWakeClearsDocumentLeftWithoutSpans(t *testing.T) {
 }
 
 func TestWakeComputeFailurePreservesHold(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
+	now := localTime(t, 6, 15, 23, 30)
 	app, store, _ := testApp(t, compute.Suspended, now)
 	app.Compute.(*compute.Fake).Err = errors.New("transient GCP error")
 	if err := app.Wake(context.Background()); err == nil {
@@ -228,7 +233,7 @@ func TestWakeComputeFailurePreservesHold(t *testing.T) {
 // Sleep clears state only after the suspend lands, so a failed suspend leaves
 // the hold and scheduled sleep in place and reports nothing as cleared.
 func TestSleepComputeFailurePreservesState(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 15, 0)
+	now := localTime(t, 6, 15, 15, 0)
 	app, store, buf := testApp(t, compute.Running, now)
 	if err := app.KeepAwake(context.Background(), 3*time.Hour); err != nil {
 		t.Fatal(err)
@@ -253,7 +258,7 @@ func TestSleepComputeFailurePreservesState(t *testing.T) {
 // Sleep suspends before touching Firestore, so a state-store failure cannot
 // leave a billable VM running.
 func TestSleepStoreFailureStillSuspends(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 22, 0)
+	now := localTime(t, 6, 15, 22, 0)
 	app, store, _ := testApp(t, compute.Running, now)
 	store.Err = errors.New("firestore unavailable")
 	err := app.Sleep(context.Background())
@@ -269,7 +274,7 @@ func TestSleepStoreFailureStillSuspends(t *testing.T) {
 // A failed state read must not stop the clear: the state change does not depend
 // on the reporting half.
 func TestSleepAndCancelClearDespiteReadFailure(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 22, 0)
+	now := localTime(t, 6, 15, 22, 0)
 	const want = "Cleared any keep-awake hold and scheduled sleep (could not read what was in effect: firestore read failed).\n"
 
 	t.Run("sleep", func(t *testing.T) {
@@ -305,7 +310,7 @@ func TestSleepAndCancelClearDespiteReadFailure(t *testing.T) {
 // A manual sleep also discards a *future* scheduled sleep, which only the
 // cancelled-sleep line tells the user about.
 func TestSleepReportsDiscardedScheduledSleep(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 15, 0)
+	now := localTime(t, 6, 15, 15, 0)
 	app, store, buf := testApp(t, compute.Running, now)
 	if err := app.SleepAt(context.Background(), "20:00"); err != nil {
 		t.Fatal(err)
@@ -325,7 +330,7 @@ func TestSleepReportsDiscardedScheduledSleep(t *testing.T) {
 }
 
 func TestSleepAtSchedulesSleep(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 15, 0)
+	now := localTime(t, 6, 15, 15, 0)
 	app, store, buf := testApp(t, compute.Running, now)
 	if err := app.SleepAt(context.Background(), "20:00"); err != nil {
 		t.Fatal(err)
@@ -334,7 +339,7 @@ func TestSleepAtSchedulesSleep(t *testing.T) {
 	if doc.Sleep == nil || doc.Sleep.State != schedule.Asleep {
 		t.Fatalf("expected a scheduled sleep, got %+v", doc.Sleep)
 	}
-	if want := localTime(t, 2026, 6, 15, 20, 0); !doc.Sleep.Start.Equal(want) {
+	if want := localTime(t, 6, 15, 20, 0); !doc.Sleep.Start.Equal(want) {
 		t.Errorf("scheduled sleep start = %v, want %v", doc.Sleep.Start, want)
 	}
 	want := "Scheduled sleep: workbox suspends at Mon 2026-06-15 20:00 CEST and is held asleep until Tue 2026-06-16 06:00 CEST; it never wakes on its own — run `workbox wake` to resume.\n"
@@ -348,7 +353,7 @@ func TestSleepAtSchedulesSleep(t *testing.T) {
 }
 
 func TestSleepAtReportsReplacedSleep(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 15, 0)
+	now := localTime(t, 6, 15, 15, 0)
 	app, store, buf := testApp(t, compute.Running, now)
 	if err := app.SleepAt(context.Background(), "20:00"); err != nil {
 		t.Fatal(err)
@@ -361,7 +366,7 @@ func TestSleepAtReportsReplacedSleep(t *testing.T) {
 		t.Errorf("replacing a scheduled sleep should be reported\ngot:\n%s", out)
 	}
 	doc, _ := store.Load(context.Background())
-	if want := localTime(t, 2026, 6, 15, 22, 30); doc.Sleep == nil || !doc.Sleep.Start.Equal(want) {
+	if want := localTime(t, 6, 15, 22, 30); doc.Sleep == nil || !doc.Sleep.Start.Equal(want) {
 		t.Errorf("scheduled sleep = %+v, want start %v", doc.Sleep, want)
 	}
 
@@ -392,7 +397,7 @@ func TestNormalizeHHMM(t *testing.T) {
 
 // A bad time is reported as typed, not in its normalized form.
 func TestSleepAtRejectsBadTimeAsTyped(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 15, 0)
+	now := localTime(t, 6, 15, 15, 0)
 	app, _, _ := testApp(t, compute.Running, now)
 	err := app.SleepAt(context.Background(), "2560")
 	if want := `invalid time "2560": want HH:MM or HHMM, 00:00-23:59`; err == nil || err.Error() != want {
@@ -401,13 +406,13 @@ func TestSleepAtRejectsBadTimeAsTyped(t *testing.T) {
 }
 
 func TestSleepAtAcceptsColonlessTime(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 15, 0)
+	now := localTime(t, 6, 15, 15, 0)
 	app, store, _ := testApp(t, compute.Running, now)
 	if err := app.SleepAt(context.Background(), "2000"); err != nil {
 		t.Fatal(err)
 	}
 	doc, _ := store.Load(context.Background())
-	if want := localTime(t, 2026, 6, 15, 20, 0); doc.Sleep == nil || !doc.Sleep.Start.Equal(want) {
+	if want := localTime(t, 6, 15, 20, 0); doc.Sleep == nil || !doc.Sleep.Start.Equal(want) {
 		t.Errorf("scheduled sleep = %+v, want start %v", doc.Sleep, want)
 	}
 }
@@ -415,7 +420,7 @@ func TestSleepAtAcceptsColonlessTime(t *testing.T) {
 // A hold that outlasts the scheduled start is warned about; one that ends
 // before it is not (the sleep does not override it).
 func TestSleepAtWarnsWhenHoldIsSuperseded(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 15, 0)
+	now := localTime(t, 6, 15, 15, 0)
 	const warning = "The keep-awake hold until Mon 2026-06-15 21:00 CEST stays in place, but the scheduled sleep wins from Mon 2026-06-15 20:00 CEST.\n"
 
 	app, _, buf := testApp(t, compute.Running, now)
@@ -444,7 +449,7 @@ func TestSleepAtWarnsWhenHoldIsSuperseded(t *testing.T) {
 }
 
 func TestSleepAtKeepsHold(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 15, 0)
+	now := localTime(t, 6, 15, 15, 0)
 	app, store, _ := testApp(t, compute.Running, now)
 	if err := app.KeepAwake(context.Background(), 3*time.Hour); err != nil {
 		t.Fatal(err)
@@ -462,7 +467,7 @@ func TestSleepAtKeepsHold(t *testing.T) {
 }
 
 func TestShortKeepAwakeDoesNotCancelSleepViaPreservedHold(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 15, 0)
+	now := localTime(t, 6, 15, 15, 0)
 	app, store, buf := testApp(t, compute.Running, now)
 	// 6h hold (to 21:00), then a 20:00 sleep that wins where they overlap.
 	if err := app.KeepAwake(context.Background(), 6*time.Hour); err != nil {
@@ -488,7 +493,7 @@ func TestShortKeepAwakeDoesNotCancelSleepViaPreservedHold(t *testing.T) {
 }
 
 func TestKeepAwakeKeepsLaterScheduledSleep(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 15, 0)
+	now := localTime(t, 6, 15, 15, 0)
 	app, store, _ := testApp(t, compute.Running, now)
 	if err := app.SleepAt(context.Background(), "20:00"); err != nil {
 		t.Fatal(err)
@@ -507,7 +512,7 @@ func TestKeepAwakeKeepsLaterScheduledSleep(t *testing.T) {
 // sleep survives the call — a sleep outranks the hold.
 func TestKeepAwakeRedundancyNote(t *testing.T) {
 	const note = "idle shutdown is disabled, so nothing would auto-suspend anyway"
-	now := localTime(t, 2026, 6, 15, 15, 0)
+	now := localTime(t, 6, 15, 15, 0)
 
 	t.Run("no sleep: the note stands", func(t *testing.T) {
 		app, _, buf := testApp(t, compute.Running, now)
@@ -539,7 +544,7 @@ func TestKeepAwakeRedundancyNote(t *testing.T) {
 	t.Run("surviving sleep: no note", func(t *testing.T) {
 		app, store, buf := testApp(t, compute.Running, now)
 		disableIdle(app)
-		sleep := &schedule.Span{Start: localTime(t, 2026, 6, 15, 23, 0), End: localTime(t, 2026, 6, 16, 6, 0), State: schedule.Asleep}
+		sleep := &schedule.Span{Start: localTime(t, 6, 15, 23, 0), End: localTime(t, 6, 16, 6, 0), State: schedule.Asleep}
 		if err := store.Save(context.Background(), &state.Document{Sleep: sleep}); err != nil {
 			t.Fatal(err)
 		}
@@ -559,7 +564,7 @@ func TestKeepAwakeRedundancyNote(t *testing.T) {
 // A hold ending exactly when the sleep starts does not overlap it ([start, end)
 // spans), so the sleep stands.
 func TestKeepAwakeEndingAtSleepStartKeepsSleep(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 15, 0)
+	now := localTime(t, 6, 15, 15, 0)
 	app, store, _ := testApp(t, compute.Running, now)
 	if err := app.SleepAt(context.Background(), "20:00"); err != nil {
 		t.Fatal(err)
@@ -574,7 +579,7 @@ func TestKeepAwakeEndingAtSleepStartKeepsSleep(t *testing.T) {
 }
 
 func TestKeepAwakeSetsHoldWakesAndClearsOverlappingSleep(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 15, 0)
+	now := localTime(t, 6, 15, 15, 0)
 	app, store, buf := testApp(t, compute.Suspended, now)
 	// A scheduled sleep at 20:00 exists first; a 6h hold runs past it.
 	if err := app.SleepAt(context.Background(), "20:00"); err != nil {
@@ -602,7 +607,7 @@ func TestKeepAwakeSetsHoldWakesAndClearsOverlappingSleep(t *testing.T) {
 }
 
 func TestKeepAwakeNeverShortensExistingHold(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 1, 0)
+	now := localTime(t, 6, 15, 1, 0)
 	app, store, buf := testApp(t, compute.Suspended, now)
 	// Establish a long hold (4h) first.
 	if err := app.KeepAwake(context.Background(), 4*time.Hour); err != nil {
@@ -622,7 +627,7 @@ func TestKeepAwakeNeverShortensExistingHold(t *testing.T) {
 }
 
 func TestCancelClears(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 15, 0)
+	now := localTime(t, 6, 15, 15, 0)
 	app, store, buf := testApp(t, compute.Running, now)
 	if err := app.SleepAt(context.Background(), "20:00"); err != nil {
 		t.Fatal(err)
@@ -643,7 +648,7 @@ func TestCancelClears(t *testing.T) {
 }
 
 func TestCancelWithNothingInEffect(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 15, 0)
+	now := localTime(t, 6, 15, 15, 0)
 	app, store, buf := testApp(t, compute.Running, now)
 	// Only an expired hold is stored: invisible to the pruned view, but the
 	// document must still be deleted.
@@ -664,7 +669,7 @@ func TestCancelWithNothingInEffect(t *testing.T) {
 }
 
 func TestPrintStatusWithinWorkingHours(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 12, 0) // within working hours
+	now := localTime(t, 6, 15, 12, 0) // within working hours
 	app, _, buf := testApp(t, compute.Running, now)
 	if err := app.PrintStatus(context.Background()); err != nil {
 		t.Fatal(err)
@@ -684,7 +689,7 @@ func TestPrintStatusWithinWorkingHours(t *testing.T) {
 }
 
 func TestPrintStatusIdleWithActivity(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30) // outside working hours
+	now := localTime(t, 6, 15, 23, 30) // outside working hours
 	app, _, buf := testApp(t, compute.Running, now)
 	app.Activity = compute.FakeActivity{ActiveAt: now.Add(-5 * time.Minute), ActiveOK: true}
 	if err := app.PrintStatus(context.Background()); err != nil {
@@ -706,7 +711,7 @@ func TestPrintStatusIdleWithActivity(t *testing.T) {
 // A last-active ahead of the local clock (VM/laptop skew) must read as zero
 // idle, never as a negative duration.
 func TestPrintStatusIdleClampedOnClockSkew(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30) // outside working hours
+	now := localTime(t, 6, 15, 23, 30) // outside working hours
 	app, _, buf := testApp(t, compute.Running, now)
 	app.Activity = compute.FakeActivity{ActiveAt: now.Add(time.Minute), ActiveOK: true}
 	if err := app.PrintStatus(context.Background()); err != nil {
@@ -731,7 +736,7 @@ func TestPrintStatusIdleClampedOnClockSkew(t *testing.T) {
 }
 
 func TestPrintStatusNoActivityReported(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 12, 0) // within working hours
+	now := localTime(t, 6, 15, 12, 0) // within working hours
 	app, _, buf := testApp(t, compute.Running, now)
 	app.Activity = compute.FakeActivity{}
 	if err := app.PrintStatus(context.Background()); err != nil {
@@ -745,7 +750,7 @@ func TestPrintStatusNoActivityReported(t *testing.T) {
 // Emitter wired but never reported, outside working hours: the VM is about to be
 // suspended, and both lines must say so.
 func TestPrintStatusNoActivityReportedSuspends(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30) // outside working hours
+	now := localTime(t, 6, 15, 23, 30) // outside working hours
 	app, _, buf := testApp(t, compute.Running, now)
 	app.Activity = compute.FakeActivity{}
 	if err := app.PrintStatus(context.Background()); err != nil {
@@ -776,7 +781,7 @@ func TestPrintStatusNoActivityReportedSuspends(t *testing.T) {
 }
 
 func TestPrintStatusActivityUnavailable(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30) // outside working hours
+	now := localTime(t, 6, 15, 23, 30) // outside working hours
 	app, _, buf := testApp(t, compute.Running, now)
 	app.Activity = compute.FakeActivity{ActiveErr: errors.New("permission denied")}
 	if err := app.PrintStatus(context.Background()); err != nil {
@@ -845,7 +850,7 @@ func TestDaysLabel(t *testing.T) {
 }
 
 func TestPrintStatusWithoutWorkingHours(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 12, 0)
+	now := localTime(t, 6, 15, 12, 0)
 	app, _, buf := testApp(t, compute.Running, now)
 	sc, err := schedule.Disabled("Europe/Stockholm")
 	if err != nil {
@@ -906,7 +911,7 @@ func TestPrintStatusScheduleLines(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			now := localTime(t, 2026, 6, 15, 23, 30) // outside working hours
+			now := localTime(t, 6, 15, 23, 30) // outside working hours
 			app, _, buf := testApp(t, compute.Running, now)
 			tc.setup(app)
 			if err := app.PrintStatus(context.Background()); err != nil {
@@ -924,7 +929,7 @@ func TestPrintStatusScheduleLines(t *testing.T) {
 // An unreadable activity value leaves the boot grace to decide here (the
 // reconciler instead retries the tick), while still reporting the read failure.
 func TestPrintStatusBootGraceWithActivityError(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30) // outside working hours
+	now := localTime(t, 6, 15, 23, 30) // outside working hours
 	app, _, buf := testApp(t, compute.Running, now)
 	app.Activity = compute.FakeActivity{ActiveErr: errors.New("parsing guest attribute"), LastStartAt: now.Add(-5 * time.Minute)}
 	if err := app.PrintStatus(context.Background()); err != nil {
@@ -943,7 +948,7 @@ func TestPrintStatusBootGraceWithActivityError(t *testing.T) {
 // A failed start-time read makes an idle verdict unknown (the start could have
 // meant boot grace) without hiding an activity value that was read.
 func TestPrintStatusStartReadError(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30) // outside working hours
+	now := localTime(t, 6, 15, 23, 30) // outside working hours
 	app, _, buf := testApp(t, compute.Running, now)
 	app.Activity = compute.FakeActivity{ActiveAt: now.Add(-2 * time.Hour), ActiveOK: true, LastStartErr: errors.New("getting instance")}
 	if err := app.PrintStatus(context.Background()); err != nil {
@@ -1005,7 +1010,7 @@ func TestPrintStatusStartReadError(t *testing.T) {
 // A value workbox disregards is shown as ignored, and the verdict counts no
 // activity — the reconciler does not count such a value as activity either.
 func TestPrintStatusIgnoredActivity(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30) // outside working hours
+	now := localTime(t, 6, 15, 23, 30) // outside working hours
 	for _, tc := range []struct {
 		name   string
 		act    compute.FakeActivity
@@ -1050,7 +1055,7 @@ func TestPrintStatusIgnoredActivity(t *testing.T) {
 
 // Without an activity reader the CLI cannot tell "no activity" from "unread".
 func TestStatusJSONNoActivityReader(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30) // outside working hours
+	now := localTime(t, 6, 15, 23, 30) // outside working hours
 	app, _, buf := testApp(t, compute.Running, now)
 	if err := app.PrintStatusJSON(context.Background()); err != nil {
 		t.Fatal(err)
@@ -1066,7 +1071,7 @@ func TestStatusJSONNoActivityReader(t *testing.T) {
 
 // A freshly booted VM with no activity yet is protected by the boot grace.
 func TestPrintStatusBootGrace(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30) // outside working hours
+	now := localTime(t, 6, 15, 23, 30) // outside working hours
 	app, _, buf := testApp(t, compute.Running, now)
 	app.Activity = compute.FakeActivity{LastStartAt: now.Add(-5 * time.Minute)}
 	if err := app.PrintStatus(context.Background()); err != nil {
@@ -1079,7 +1084,7 @@ func TestPrintStatusBootGrace(t *testing.T) {
 
 // The earliest idle suspend counts from the later of activity and last start.
 func TestPrintStatusEarliestSuspendUsesLaterOfBoth(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30) // outside working hours
+	now := localTime(t, 6, 15, 23, 30) // outside working hours
 	app, _, buf := testApp(t, compute.Running, now)
 	app.Activity = compute.FakeActivity{
 		ActiveAt: now.Add(-20 * time.Minute), ActiveOK: true, LastStartAt: now.Add(-10 * time.Minute),
@@ -1096,7 +1101,7 @@ func TestPrintStatusEarliestSuspendUsesLaterOfBoth(t *testing.T) {
 // A suspend time that would fall inside working hours is not named: the
 // working-hours rule inhibits it.
 func TestPrintStatusNoEarliestSuspendInsideWorkingHours(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 5, 45) // before the 06:00 window
+	now := localTime(t, 6, 15, 5, 45) // before the 06:00 window
 	app, _, buf := testApp(t, compute.Running, now)
 	app.Activity = compute.FakeActivity{ActiveAt: now, ActiveOK: true}
 	if err := app.PrintStatus(context.Background()); err != nil {
@@ -1109,7 +1114,7 @@ func TestPrintStatusNoEarliestSuspendInsideWorkingHours(t *testing.T) {
 
 // With idle shutdown off, the working-hours line agrees with the idle line.
 func TestPrintStatusWithinHoursIdleDisabled(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 12, 0) // within working hours
+	now := localTime(t, 6, 15, 12, 0) // within working hours
 	app, _, buf := testApp(t, compute.Running, now)
 	disableIdle(app)
 	if err := app.PrintStatus(context.Background()); err != nil {
@@ -1127,9 +1132,9 @@ func TestPrintStatusWithinHoursIdleDisabled(t *testing.T) {
 
 // A scheduled sleep in effect shows its span, not a start time in the past.
 func TestPrintStatusScheduledSleepInEffect(t *testing.T) {
-	now := localTime(t, 2026, 6, 16, 2, 0)
+	now := localTime(t, 6, 16, 2, 0)
 	app, store, buf := testApp(t, compute.Running, now)
-	sleep := &schedule.Span{Start: localTime(t, 2026, 6, 15, 23, 0), End: localTime(t, 2026, 6, 16, 6, 0), State: schedule.Asleep}
+	sleep := &schedule.Span{Start: localTime(t, 6, 15, 23, 0), End: localTime(t, 6, 16, 6, 0), State: schedule.Asleep}
 	if err := store.Save(context.Background(), &state.Document{Sleep: sleep}); err != nil {
 		t.Fatal(err)
 	}
@@ -1183,7 +1188,7 @@ func TestReconcilerReturnsNotRunning(t *testing.T) {
 }
 
 func TestSleepSuspendsAndClears(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 22, 0)
+	now := localTime(t, 6, 15, 22, 0)
 	app, store, buf := testApp(t, compute.Running, now)
 	// Pre-existing keep-awake hold that a manual sleep should clear.
 	if err := app.KeepAwake(context.Background(), 3*time.Hour); err != nil {
@@ -1205,7 +1210,7 @@ func TestSleepSuspendsAndClears(t *testing.T) {
 // generic map, so renaming a json tag breaks the test (a round-trip through
 // StatusJSON would not).
 func TestStatusJSONKeys(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30) // outside working hours
+	now := localTime(t, 6, 15, 23, 30) // outside working hours
 	app, store, buf := testApp(t, compute.Running, now)
 	// Set for realism; the JSON days field comes from app.Sched below.
 	app.Cfg.Schedule.WorkingHours.Days = []string{"mon", "tue", "wed", "thu", "fri"}
@@ -1261,7 +1266,7 @@ func TestStatusJSONKeys(t *testing.T) {
 
 // An ignored activity value appears under activity_ignored, never as activity.
 func TestStatusJSONIgnoredActivityKeys(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
+	now := localTime(t, 6, 15, 23, 30)
 	app, _, buf := testApp(t, compute.Running, now)
 	app.Activity = compute.FakeActivity{ActiveAt: now.Add(10 * time.Minute), ActiveOK: true}
 	if err := app.PrintStatusJSON(context.Background()); err != nil {
@@ -1280,7 +1285,7 @@ func TestStatusJSONIgnoredActivityKeys(t *testing.T) {
 }
 
 func TestStatusJSONStable(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 12, 0)
+	now := localTime(t, 6, 15, 12, 0)
 	app, _, buf := testApp(t, compute.Running, now)
 	if err := app.PrintStatusJSON(context.Background()); err != nil {
 		t.Fatal(err)
@@ -1316,7 +1321,7 @@ func TestStatusJSONStable(t *testing.T) {
 }
 
 func TestStatusJSONSuspended(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 2, 0)
+	now := localTime(t, 6, 15, 2, 0)
 	app, _, buf := testApp(t, compute.Suspended, now)
 	if err := app.PrintStatusJSON(context.Background()); err != nil {
 		t.Fatal(err)
@@ -1362,7 +1367,7 @@ func TestSchedule(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			now := localTime(t, 2026, 6, 15, 12, 0)
+			now := localTime(t, 6, 15, 12, 0)
 			app, store, buf := testApp(t, compute.Running, now)
 			if tc.doc != nil {
 				if err := store.Save(context.Background(), tc.doc); err != nil {

@@ -29,9 +29,10 @@ func capacityErr() *compute.CapacityError {
 // retryApp is testApp with a clock the retry loop can move: the injected wait
 // advances it instead of the wall clock, so the tests run instantly and the
 // give-up deadline is exact. clock.Now() reports the current fake time.
-func retryApp(t *testing.T, vm compute.State, now time.Time) (app *App, store *state.Fake, buf *bytes.Buffer, clock *testClock) {
+// The VM is always SUSPENDED: a capacity failure comes from the resume.
+func retryApp(t *testing.T, now time.Time) (app *App, store *state.Fake, buf *bytes.Buffer, clock *testClock) {
 	t.Helper()
-	app, store, buf = testApp(t, vm, now)
+	app, store, buf = testApp(t, compute.Suspended, now)
 	app.Cfg.GCP.Zone = "europe-north2-a"
 	app.Cfg.GCP.MachineType = "e2-custom-4-8192"
 	clock = &testClock{now: now}
@@ -148,10 +149,11 @@ func seedSleep(t *testing.T, app *App, now time.Time, hhmm string) {
 	}
 }
 
-func countCalls(calls []string, name string) int {
+// countResumes counts resume attempts; the retry loop makes one per attempt.
+func countResumes(calls []string) int {
 	n := 0
 	for _, c := range calls {
-		if c == name {
+		if c == "resume" {
 			n++
 		}
 	}
@@ -161,15 +163,15 @@ func countCalls(calls []string, name string) int {
 // A zone that frees up within the window resumes the VM without the user
 // having to run their own retry loop.
 func TestWakeRetriesUntilCapacityReturns(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30) // outside working hours
-	app, store, buf, clock := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30) // outside working hours
+	app, store, buf, clock := retryApp(t, now)
 	fake := app.Compute.(*compute.Fake)
 	fake.ErrSeq = []error{capacityErr(), capacityErr(), nil}
 
 	if err := app.Wake(context.Background()); err != nil {
 		t.Fatalf("Wake = %v, want nil", err)
 	}
-	if got := countCalls(fake.Calls, "resume"); got != 3 {
+	if got := countResumes(fake.Calls); got != 3 {
 		t.Errorf("resume calls = %d, want 3 (%v)", got, fake.Calls)
 	}
 	if s, _ := app.Compute.Status(context.Background()); s != compute.Running {
@@ -209,8 +211,8 @@ func TestWakeRetriesUntilCapacityReturns(t *testing.T) {
 // A zone that stays full gives up at the window and explains the options,
 // while the error itself stays a single line for main() to print.
 func TestWakeCapacityGivesUpWithRemedies(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, store, buf, clock := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, store, buf, clock := retryApp(t, now)
 	fake := app.Compute.(*compute.Fake)
 	fake.Err = capacityErr()
 
@@ -228,7 +230,7 @@ func TestWakeCapacityGivesUpWithRemedies(t *testing.T) {
 	// Attempts at 0s, 30s, ..., 300s: the last one starts exactly on the
 	// deadline, and none after it.
 	wantAttempts := int(capacityRetryWindow/capacityRetryInterval) + 1
-	if got := countCalls(fake.Calls, "resume"); got != wantAttempts {
+	if got := countResumes(fake.Calls); got != wantAttempts {
 		t.Errorf("resume calls = %d, want %d (%v)", got, wantAttempts, fake.Calls)
 	}
 	if !clock.Now().Equal(now.Add(capacityRetryWindow)) {
@@ -288,8 +290,8 @@ func TestWakeCapacityGivesUpWithRemedies(t *testing.T) {
 // that lands after we stopped waiting leaves the VM RUNNING for a reconciler that
 // suspends a RUNNING VM whose hold has lapsed.
 func TestWakeCapacityGiveUpKeepsAShortGraceAlive(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, store, _, clock := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, store, _, clock := retryApp(t, now)
 	five := 5
 	app.Cfg.Schedule.IdleTimeoutMinutes = &five
 	fake := app.Compute.(*compute.Fake)
@@ -324,8 +326,8 @@ func TestWakeCapacityGiveUpKeepsAShortGraceAlive(t *testing.T) {
 // but a code, so the CLI fills the zone and machine type from config and leaves
 // out the lines it has no server text for.
 func TestWakeCapacityReportsBareErrorFromConfig(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, _, buf, _ := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, _, buf, _ := retryApp(t, now)
 	fake := app.Compute.(*compute.Fake)
 	fake.Err = &compute.CapacityError{Code: "ZONE_RESOURCE_POOL_EXHAUSTED"}
 
@@ -356,8 +358,8 @@ func TestWakeCapacityReportsBareErrorFromConfig(t *testing.T) {
 // The first notice quotes the time actually left, which a slow first attempt has
 // already eaten into.
 func TestWakeCapacityFirstNoticeQuotesTheTimeLeft(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, _, buf, clock := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, _, buf, clock := retryApp(t, now)
 	fake := app.Compute.(*compute.Fake)
 	fake.Err = capacityErr()
 	// 90s per attempt leaves 3m30s of the window when the first one fails. The
@@ -378,8 +380,8 @@ func TestWakeCapacityFirstNoticeQuotesTheTimeLeft(t *testing.T) {
 // itself is slow: the loop must not start another one, and the report must read
 // correctly for one attempt and a wait longer than the window.
 func TestWakeCapacitySingleSlowAttempt(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, _, buf, clock := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, _, buf, clock := retryApp(t, now)
 	fake := app.Compute.(*compute.Fake)
 	fake.Err = capacityErr()
 	// Stand in for a resume that takes six minutes to fail.
@@ -388,7 +390,7 @@ func TestWakeCapacitySingleSlowAttempt(t *testing.T) {
 	if err := app.Wake(context.Background()); !errors.Is(err, compute.ErrNoCapacity) {
 		t.Fatalf("Wake = %v, want a capacity error", err)
 	}
-	if got := countCalls(fake.Calls, "resume"); got != 1 {
+	if got := countResumes(fake.Calls); got != 1 {
 		t.Errorf("resume calls = %d, want 1: no attempt may start past the deadline (%v)", got, fake.Calls)
 	}
 	if want := "No capacity for e2-custom-4-8192 in europe-north2-a after 1 attempt across 6 minutes.\n"; !strings.Contains(buf.String(), want) {
@@ -399,8 +401,8 @@ func TestWakeCapacitySingleSlowAttempt(t *testing.T) {
 // With idle shutdown off there is no hold to keep alive, so the retry runs with
 // no top-up at all.
 func TestWakeCapacityRetriesWithoutAHold(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, store, buf, _ := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, store, buf, _ := retryApp(t, now)
 	disableIdle(app)
 	fake := app.Compute.(*compute.Fake)
 	fake.ErrSeq = []error{capacityErr(), nil}
@@ -424,8 +426,8 @@ func TestWakeCapacityRetriesWithoutAHold(t *testing.T) {
 // A failure that arrives after a capacity wait is still a failure: no hold
 // extension is reported for a wake that did not succeed.
 func TestWakeCapacityThenOtherFailureReportsNoExtension(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, _, buf, _ := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, _, buf, _ := retryApp(t, now)
 	boom := errors.New("boom")
 	fake := app.Compute.(*compute.Fake)
 	fake.ErrSeq = []error{capacityErr(), boom}
@@ -443,8 +445,8 @@ func TestWakeCapacityThenOtherFailureReportsNoExtension(t *testing.T) {
 // command starts, in effect by the time capacity returns five attempts later.
 func sleepDuringWaitApp(t *testing.T) (*App, *state.Fake, *bytes.Buffer) {
 	t.Helper()
-	now := localTime(t, 2026, 6, 15, 23, 58)
-	app, store, buf, _ := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 58)
+	app, store, buf, _ := retryApp(t, now)
 	seedSleep(t, app, now, "00:00")
 	fake := app.Compute.(*compute.Fake)
 	for range 5 {
@@ -524,8 +526,8 @@ func TestWakeReportsSleepCancellationItCouldNotWrite(t *testing.T) {
 // A capacity-failed resume can leave the VM TERMINATED (the memory image is
 // discarded). The next attempt must start it rather than resume it.
 func TestWakeRetryStartsTerminatedVM(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, _, _, _ := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, _, _, _ := retryApp(t, now)
 	fake := app.Compute.(*compute.Fake)
 	fake.StatusSeq = []compute.State{compute.Suspended, compute.Terminated}
 	fake.ErrSeq = []error{capacityErr(), nil}
@@ -541,7 +543,7 @@ func TestWakeRetryStartsTerminatedVM(t *testing.T) {
 
 // Only capacity is retried: anything else is the user's problem to fix now.
 func TestWakeDoesNotRetryOtherFailures(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
+	now := localTime(t, 6, 15, 23, 30)
 	for _, tc := range []struct {
 		name string
 		err  error
@@ -550,14 +552,14 @@ func TestWakeDoesNotRetryOtherFailures(t *testing.T) {
 		{name: "unsupported state", err: compute.ErrUnsupportedState},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			app, _, buf, clock := retryApp(t, compute.Suspended, now)
+			app, _, buf, clock := retryApp(t, now)
 			fake := app.Compute.(*compute.Fake)
 			fake.Err = tc.err
 
 			if err := app.Wake(context.Background()); !errors.Is(err, tc.err) {
 				t.Fatalf("Wake = %v, want %v", err, tc.err)
 			}
-			if got := countCalls(fake.Calls, "resume"); got != 1 {
+			if got := countResumes(fake.Calls); got != 1 {
 				t.Errorf("resume calls = %d, want 1 (%v)", got, fake.Calls)
 			}
 			if !clock.Now().Equal(now) {
@@ -572,8 +574,8 @@ func TestWakeDoesNotRetryOtherFailures(t *testing.T) {
 
 // Ctrl-C during a retry wait stops the wake instead of running out the window.
 func TestWakeCapacityRetryHonorsCancellation(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, _, _, _ := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, _, _, _ := retryApp(t, now)
 	fake := app.Compute.(*compute.Fake)
 	fake.Err = capacityErr()
 	app.wait = func(_ context.Context, _ time.Duration) error { return context.Canceled }
@@ -581,15 +583,15 @@ func TestWakeCapacityRetryHonorsCancellation(t *testing.T) {
 	if err := app.Wake(context.Background()); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Wake = %v, want context.Canceled", err)
 	}
-	if got := countCalls(fake.Calls, "resume"); got != 1 {
+	if got := countResumes(fake.Calls); got != 1 {
 		t.Errorf("resume calls = %d, want 1 (%v)", got, fake.Calls)
 	}
 }
 
 // An already-cancelled context makes no compute call.
 func TestWakeCapacityRetrySkipsCancelledContext(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, _, _, _ := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, _, _, _ := retryApp(t, now)
 	fake := app.Compute.(*compute.Fake)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -605,8 +607,8 @@ func TestWakeCapacityRetrySkipsCancelledContext(t *testing.T) {
 // The grace matters most with a short idle timeout, where retrying could
 // otherwise consume all of it and let the reconciler suspend a booting VM.
 func TestWakeExtendsShortGraceAfterRetrying(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, store, _, clock := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, store, _, clock := retryApp(t, now)
 	five := 5
 	app.Cfg.Schedule.IdleTimeoutMinutes = &five
 	refreshes := 0
@@ -649,15 +651,15 @@ func TestWakeExtendsShortGraceAfterRetrying(t *testing.T) {
 // `keep-awake 3h` promises three hours of awake VM, so a capacity wait is not
 // taken out of the hold: it is re-measured once the VM is up.
 func TestKeepAwakeRetriesCapacity(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, store, buf, clock := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, store, buf, clock := retryApp(t, now)
 	fake := app.Compute.(*compute.Fake)
 	fake.ErrSeq = []error{capacityErr(), nil}
 
 	if err := app.KeepAwake(context.Background(), 3*time.Hour); err != nil {
 		t.Fatalf("KeepAwake = %v, want nil", err)
 	}
-	if got := countCalls(fake.Calls, "resume"); got != 2 {
+	if got := countResumes(fake.Calls); got != 2 {
 		t.Errorf("resume calls = %d, want 2 (%v)", got, fake.Calls)
 	}
 	doc, _ := store.Load(context.Background())
@@ -678,8 +680,8 @@ func TestKeepAwakeRetriesCapacity(t *testing.T) {
 // can come up on any attempt, and the reconciler suspends a RUNNING VM whose
 // hold has lapsed.
 func TestKeepAwakeKeepsHoldAliveWhileWaiting(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, store, _, clock := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, store, _, clock := retryApp(t, now)
 	fake := app.Compute.(*compute.Fake)
 	for range 4 {
 		fake.ErrSeq = append(fake.ErrSeq, capacityErr())
@@ -710,8 +712,8 @@ func TestKeepAwakeKeepsHoldAliveWhileWaiting(t *testing.T) {
 // A mid-wait refresh must not quietly delete a scheduled sleep: only the
 // reported extension cancels one, so the user always hears about it.
 func TestKeepAwakeRefreshDoesNotSilentlyCancelSleep(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 18, 0)
-	app, store, buf, _ := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 18, 0)
+	app, store, buf, _ := retryApp(t, now)
 	// A sleep just past the requested hold (18:02, and the reach test is strict,
 	// so the pre-wake write preserves it). A mid-wait refresh at 18:00:30 would
 	// reach past it; the reported extension at 18:01 does, and says so.
@@ -745,8 +747,8 @@ func TestKeepAwakeRefreshDoesNotSilentlyCancelSleep(t *testing.T) {
 // The qualifier a hold was first reported with travels with it, so the extension
 // line does not read as a different hold.
 func TestKeepAwakeExtensionKeepsTheReportedQualifier(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, _, buf, _ := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, _, buf, _ := retryApp(t, now)
 	disableIdle(app)
 	fake := app.Compute.(*compute.Fake)
 	fake.ErrSeq = []error{capacityErr(), nil}
@@ -763,8 +765,8 @@ func TestKeepAwakeExtensionKeepsTheReportedQualifier(t *testing.T) {
 // A hold short enough to be eaten by the capacity wait is exactly the case the
 // re-measurement exists for: without it the VM comes up with an expired hold.
 func TestKeepAwakeShortHoldSurvivesCapacityWait(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, store, _, clock := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, store, _, clock := retryApp(t, now)
 	fake := app.Compute.(*compute.Fake)
 	fake.ErrSeq = []error{capacityErr(), capacityErr(), nil}
 
@@ -783,8 +785,8 @@ func TestKeepAwakeShortHoldSurvivesCapacityWait(t *testing.T) {
 // A wake that preserved a longer hold of the user's own still gets that hold
 // extended when the capacity wait leaves it shorter than the boot window needs.
 func TestWakeExtendsPreservedHoldAfterWaiting(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, store, buf, clock := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, store, buf, clock := retryApp(t, now)
 	five := 5
 	app.Cfg.Schedule.IdleTimeoutMinutes = &five // grace is 5m + 3m ssh wait
 	// A user hold ending just past the pre-wake grace: kept as-is by Wake, but
@@ -829,8 +831,8 @@ func TestWakeExtendsPreservedHoldAfterWaiting(t *testing.T) {
 // write must not turn a successful wake into a failed command, which in the
 // ssh/herdr flows would cost the user the session on a running VM.
 func TestWakeReportsButSurvivesFailedHoldExtension(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, store, buf, _ := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, store, buf, _ := retryApp(t, now)
 	// Fail the top-up's writes; the pre-wake write must land.
 	app.Store = &countingStore{Fake: store, failSaveAfter: 1}
 	errBuf := &bytes.Buffer{}
@@ -863,8 +865,8 @@ func TestWakeReportsButSurvivesFailedHoldExtension(t *testing.T) {
 // The same holds when the extension cannot even read the current state: the
 // wake succeeded, so the command must not fail on a top-up it skipped.
 func TestWakeReportsButSurvivesFailedHoldRead(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, store, buf, _ := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, store, buf, _ := retryApp(t, now)
 	// Wake's own read is the first; every top-up read after it fails.
 	app.Store = &countingStore{Fake: store, failLoadAfter: 1}
 	errBuf := &bytes.Buffer{}
@@ -890,8 +892,8 @@ func TestWakeReportsButSurvivesFailedHoldRead(t *testing.T) {
 // The extension never shortens a hold: a long keep-awake of the user's own
 // outlasts the boot grace, so a capacity wait must leave it exactly as it was.
 func TestWakeHoldExtensionNeverShortensALongHold(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, store, buf, _ := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, store, buf, _ := retryApp(t, now)
 	existing := app.Sched.KeepAwakeHold(now, 8*time.Hour)
 	doc := &state.Document{}
 	doc.Set(state.KindHold, existing)
@@ -925,8 +927,8 @@ func TestWakeHoldExtensionNeverShortensALongHold(t *testing.T) {
 // cancelled: the extension reads current state instead of writing back the
 // snapshot it loaded before the wait.
 func TestWakeHoldExtensionDoesNotResurrectCancelledState(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, store, _, _ := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, store, _, _ := retryApp(t, now)
 	fake := app.Compute.(*compute.Fake)
 	fake.ErrSeq = []error{capacityErr(), nil}
 	// Stand in for the concurrent `workbox cancel`: clear the store while the
@@ -949,8 +951,8 @@ func TestWakeHoldExtensionDoesNotResurrectCancelledState(t *testing.T) {
 
 // A wake that never had to wait does not write the hold a second time.
 func TestWakeWithoutCapacityWaitWritesHoldOnce(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, store, _, _ := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, store, _, _ := retryApp(t, now)
 	counting := &countingStore{Fake: store}
 	app.Store = counting
 
@@ -1017,8 +1019,8 @@ func TestShortDurationRendersATypeableDuration(t *testing.T) {
 // after the deadline even when the attempts themselves consume part of it. (The
 // attempt already running when the deadline passes is never cut short.)
 func TestWakeCapacityTrimsTheFinalWait(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, _, buf, clock := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, _, buf, clock := retryApp(t, now)
 	fake := app.Compute.(*compute.Fake)
 	fake.Err = capacityErr()
 	// 31s per attempt leaves 25s of the window before the sixth one, so the
@@ -1113,8 +1115,8 @@ func TestCapacityDocsMatchTheCode(t *testing.T) {
 // A plain wake must leave a merely-future scheduled sleep alone: only keep-awake
 // cancels one its requested hold reaches over, and the grace never does.
 func TestWakeLeavesAFutureSleepAlone(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, store, buf, _ := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, store, buf, _ := retryApp(t, now)
 	// 23:50 is inside the 33-minute grace the wake re-measures, but still in the
 	// future when the VM comes up — nothing should touch it.
 	seedSleep(t, app, now, "23:50")
@@ -1136,8 +1138,8 @@ func TestWakeLeavesAFutureSleepAlone(t *testing.T) {
 // The hold report must not claim nothing would auto-suspend while a scheduled
 // sleep that will is on record.
 func TestKeepAwakeQualifierSeesASurvivingSleep(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 18, 0)
-	app, _, buf, _ := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 18, 0)
+	app, _, buf, _ := retryApp(t, now)
 	disableIdle(app)
 	// 20:00 is well past the two minutes requested, so it survives both the
 	// pre-wake rule and the re-measured hold.
@@ -1161,8 +1163,8 @@ func TestKeepAwakeQualifierSeesASurvivingSleep(t *testing.T) {
 // counterpart of the in-effect branch pinned below, with the same single-command
 // recovery.
 func TestKeepAwakeReportsFutureSleepCancellationItCouldNotWrite(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 18, 0)
-	app, store, buf, _ := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 18, 0)
+	app, store, buf, _ := retryApp(t, now)
 	// 18:02 is exactly the requested hold's end, and the pre-wake reach-over test
 	// is strict, so that pass leaves the sleep alone; only the 30-second wait
 	// pushes the re-measured hold past it.
@@ -1241,8 +1243,8 @@ func TestKeepAwakeReportsSleepCancellationItCouldNotWrite(t *testing.T) {
 // sleep it missed before the wait, and a longer pre-existing hold — which
 // suppresses the write entirely — must not suppress that cancellation.
 func TestKeepAwakeCancelsSleepUnderAPreservedLongerHold(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 18, 0)
-	app, store, buf, _ := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 18, 0)
+	app, store, buf, _ := retryApp(t, now)
 	dt, err := schedule.ParseDayTime("18:02")
 	if err != nil {
 		t.Fatal(err)
@@ -1274,8 +1276,8 @@ func TestKeepAwakeCancelsSleepUnderAPreservedLongerHold(t *testing.T) {
 // reconciler ignores must not make the report claim something would suspend the
 // VM.
 func TestKeepAwakeQualifierIgnoresAPrunedSleep(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, _, buf, clock := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, _, buf, clock := retryApp(t, now)
 	disableIdle(app)
 	fake := app.Compute.(*compute.Fake)
 	fake.ErrSeq = []error{capacityErr(), nil}
@@ -1312,7 +1314,7 @@ func TestKeepAwakeQualifierIgnoresAPrunedSleep(t *testing.T) {
 // The production wait — the one the retry loop uses when no fake clock is
 // injected — must return on cancellation rather than sitting out the interval.
 func TestWaitForHonorsCancellationAndElapses(t *testing.T) {
-	app, _, _, _ := retryApp(t, compute.Suspended, localTime(t, 2026, 6, 15, 23, 30))
+	app, _, _, _ := retryApp(t, localTime(t, 6, 15, 23, 30))
 	app.wait = nil // exercise the real timer
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1328,8 +1330,8 @@ func TestWaitForHonorsCancellationAndElapses(t *testing.T) {
 // An ordinary wake takes time too — the resume itself is not instant — but the
 // grace is sized for that, so nothing is rewritten and nothing is printed.
 func TestWakeWithoutCapacityWaitLeavesGraceAlone(t *testing.T) {
-	now := localTime(t, 2026, 6, 15, 23, 30)
-	app, store, buf, _ := retryApp(t, compute.Suspended, now)
+	now := localTime(t, 6, 15, 23, 30)
+	app, store, buf, _ := retryApp(t, now)
 	// A clock that advances on every reading, as the wall clock does during a
 	// resume that takes a while.
 	cur := now

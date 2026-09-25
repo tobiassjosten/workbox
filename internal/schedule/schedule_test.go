@@ -30,10 +30,15 @@ func mustDisabled(t *testing.T) Schedule {
 	return sc
 }
 
+// testYear is the year every test instant falls in; the month and day carry
+// the meaning (weekday, DST side), so repeating it at each call site adds
+// nothing.
+const testYear = 2026
+
 // at builds an instant in the schedule's timezone for the given date and time.
-func at(t *testing.T, sc Schedule, y int, m time.Month, d, h, min int) time.Time {
+func at(t *testing.T, sc Schedule, m time.Month, d, h, minute int) time.Time {
 	t.Helper()
-	return time.Date(y, m, d, h, min, 0, 0, sc.Loc)
+	return time.Date(testYear, m, d, h, minute, 0, 0, sc.Loc)
 }
 
 func TestParseDayTime(t *testing.T) {
@@ -111,14 +116,14 @@ func TestWithinWorkingHours(t *testing.T) {
 		{23, 0, false},
 		{23, 30, false},
 	} {
-		got := sc.WithinWorkingHours(at(t, sc, 2026, time.June, 15, tc.h, tc.m))
+		got := sc.WithinWorkingHours(at(t, sc, time.June, 15, tc.h, tc.m))
 		if got != tc.want {
 			t.Errorf("WithinWorkingHours(%02d:%02d) = %v, want %v", tc.h, tc.m, got, tc.want)
 		}
 	}
 	// A disabled schedule is never within working hours.
 	dis := mustDisabled(t)
-	if dis.WithinWorkingHours(at(t, dis, 2026, time.June, 15, 12, 0)) {
+	if dis.WithinWorkingHours(at(t, dis, time.June, 15, 12, 0)) {
 		t.Error("disabled schedule should never be within working hours")
 	}
 }
@@ -131,17 +136,17 @@ func TestWorkingHoursWeekdaysOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 2026-06-15 is a Monday; 2026-06-13 a Saturday, 2026-06-14 a Sunday.
-	if !sc.WithinWorkingHours(at(t, sc, 2026, time.June, 15, 12, 0)) {
+	if !sc.WithinWorkingHours(at(t, sc, time.June, 15, 12, 0)) {
 		t.Error("Monday noon should be within working hours")
 	}
-	if sc.WithinWorkingHours(at(t, sc, 2026, time.June, 13, 12, 0)) {
+	if sc.WithinWorkingHours(at(t, sc, time.June, 13, 12, 0)) {
 		t.Error("Saturday noon should be outside working hours (weekday-only)")
 	}
-	if sc.WithinWorkingHours(at(t, sc, 2026, time.June, 14, 12, 0)) {
+	if sc.WithinWorkingHours(at(t, sc, time.June, 14, 12, 0)) {
 		t.Error("Sunday noon should be outside working hours (weekday-only)")
 	}
 	// Outside the time window on a weekday is also outside.
-	if sc.WithinWorkingHours(at(t, sc, 2026, time.June, 15, 18, 0)) {
+	if sc.WithinWorkingHours(at(t, sc, time.June, 15, 18, 0)) {
 		t.Error("Monday 18:00 is past the window")
 	}
 }
@@ -153,12 +158,12 @@ func TestAutoSuspendWeekend(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Saturday noon, idle past timeout: no working-hours protection → suspend.
-	sat := at(t, sc, 2026, time.June, 13, 12, 0)
+	sat := at(t, sc, time.June, 13, 12, 0)
 	if got := sc.AutoSuspend(sat, Spans{}, Activity{LastActive: sat.Add(-time.Hour)}, 30*time.Minute); !got.Suspend || got.Reason != ReasonIdle {
 		t.Errorf("weekend idle: got %+v, want suspend idle", got)
 	}
 	// Monday noon, idle: protected by working hours.
-	mon := at(t, sc, 2026, time.June, 15, 12, 0)
+	mon := at(t, sc, time.June, 15, 12, 0)
 	if got := sc.AutoSuspend(mon, Spans{}, Activity{LastActive: mon.Add(-time.Hour)}, 30*time.Minute); got.Suspend || got.Reason != ReasonWorkingHours {
 		t.Errorf("weekday within hours: got %+v, want no-suspend working-hours", got)
 	}
@@ -169,8 +174,8 @@ func TestAutoSuspend(t *testing.T) {
 	const idle = 30 * time.Minute
 
 	// Reference instants.
-	noon := at(t, sc, 2026, time.June, 15, 12, 0)   // within working hours
-	night := at(t, sc, 2026, time.June, 15, 23, 30) // outside working hours
+	noon := at(t, sc, time.June, 15, 12, 0)   // within working hours
+	night := at(t, sc, time.June, 15, 23, 30) // outside working hours
 
 	holdAwake := &Span{Start: night.Add(-time.Hour), End: night.Add(time.Hour), State: Awake}
 	holdNoon := &Span{Start: noon.Add(-time.Hour), End: noon.Add(time.Hour), State: Awake}
@@ -315,7 +320,7 @@ func TestSpanBoundaries(t *testing.T) {
 func TestAutoSuspendDisabledWorkingHours(t *testing.T) {
 	sc := mustDisabled(t)
 	const idle = 30 * time.Minute
-	now := at(t, sc, 2026, time.June, 15, 12, 0)
+	now := at(t, sc, time.June, 15, 12, 0)
 	// With no working hours, midday behaves like any other time: idle governs.
 	if got := sc.AutoSuspend(now, Spans{}, Activity{LastActive: now.Add(-time.Hour)}, idle); !got.Suspend || got.Reason != ReasonIdle {
 		t.Errorf("disabled+idle: got %+v, want suspend idle", got)
@@ -327,7 +332,7 @@ func TestAutoSuspendDisabledWorkingHours(t *testing.T) {
 
 func TestKeepAwakeHold(t *testing.T) {
 	sc := mustSchedule(t)
-	now := at(t, sc, 2026, time.June, 15, 23, 30)
+	now := at(t, sc, time.June, 15, 23, 30)
 	sp := sc.KeepAwakeHold(now, 2*time.Hour)
 	if sp.State != Awake || !sp.End.Equal(now.Add(2*time.Hour)) {
 		t.Fatalf("KeepAwakeHold = %+v, want awake for 2h", sp)
@@ -343,18 +348,18 @@ func TestKeepAwakeHold(t *testing.T) {
 func TestScheduledSleepToday(t *testing.T) {
 	sc := mustSchedule(t)
 	// Afternoon; a one-off sleep at 20:00 should fire tonight.
-	now := at(t, sc, 2026, time.June, 15, 15, 0)
+	now := at(t, sc, time.June, 15, 15, 0)
 	sp := sc.ScheduledSleep(now, DayTime{20, 0})
-	wantStart := at(t, sc, 2026, time.June, 15, 20, 0)
-	wantEnd := at(t, sc, 2026, time.June, 16, 6, 0) // next working-hours start
+	wantStart := at(t, sc, time.June, 15, 20, 0)
+	wantEnd := at(t, sc, time.June, 16, 6, 0) // next working-hours start
 	if !sp.Start.Equal(wantStart) || !sp.End.Equal(wantEnd) || sp.State != Asleep {
 		t.Fatalf("ScheduledSleep = %+v, want [%v,%v) asleep", sp, wantStart, wantEnd)
 	}
 	// Before 20:00 it is not active; from 20:00 it forces suspend.
-	if sp.Active(at(t, sc, 2026, time.June, 15, 19, 0)) {
+	if sp.Active(at(t, sc, time.June, 15, 19, 0)) {
 		t.Error("scheduled sleep should not be active before its time")
 	}
-	if got := sc.AutoSuspend(at(t, sc, 2026, time.June, 15, 20, 30), Spans{Sleep: &sp}, Activity{LastActive: now}, 30*time.Minute); !got.Suspend {
+	if got := sc.AutoSuspend(at(t, sc, time.June, 15, 20, 30), Spans{Sleep: &sp}, Activity{LastActive: now}, 30*time.Minute); !got.Suspend {
 		t.Errorf("scheduled sleep should force suspend at 20:30, got %+v", got)
 	}
 }
@@ -362,7 +367,7 @@ func TestScheduledSleepToday(t *testing.T) {
 // A sleep requested for the current minute starts now, not tomorrow.
 func TestScheduledSleepAtCurrentTime(t *testing.T) {
 	sc := mustSchedule(t)
-	now := at(t, sc, 2026, time.June, 15, 20, 0)
+	now := at(t, sc, time.June, 15, 20, 0)
 	if sp := sc.ScheduledSleep(now, DayTime{20, 0}); !sp.Start.Equal(now) {
 		t.Errorf("ScheduledSleep start = %v, want %v (now)", sp.Start, now)
 	}
@@ -372,9 +377,9 @@ func TestScheduledSleepRollsToTomorrow(t *testing.T) {
 	sc := mustSchedule(t)
 	// It is already 21:00; a one-off sleep at 20:00 is in the past, so it rolls
 	// to tomorrow rather than resolving backward.
-	now := at(t, sc, 2026, time.June, 15, 21, 0)
+	now := at(t, sc, time.June, 15, 21, 0)
 	sp := sc.ScheduledSleep(now, DayTime{20, 0})
-	wantStart := at(t, sc, 2026, time.June, 16, 20, 0)
+	wantStart := at(t, sc, time.June, 16, 20, 0)
 	if !sp.Start.Equal(wantStart) {
 		t.Errorf("ScheduledSleep start = %v, want %v (tomorrow)", sp.Start, wantStart)
 	}
@@ -392,21 +397,21 @@ func TestScheduledSleepRollsOneDayInScheduleZone(t *testing.T) {
 	// 23:30 Stockholm on Sat 31 Oct 2026, seen from a laptop in New York the
 	// evening before its DST fall-back (a 25h day there). Rolling "tomorrow" in
 	// the laptop's zone would land on 2 Nov in Stockholm and skip 1 Nov.
-	now := at(t, sc, 2026, time.October, 31, 23, 30).In(ny)
+	now := at(t, sc, time.October, 31, 23, 30).In(ny)
 	sp := sc.ScheduledSleep(now, DayTime{20, 0})
-	if want := at(t, sc, 2026, time.November, 1, 20, 0); !sp.Start.Equal(want) {
+	if want := at(t, sc, time.November, 1, 20, 0); !sp.Start.Equal(want) {
 		t.Errorf("ScheduledSleep start = %v, want %v", sp.Start, want)
 	}
-	if want := at(t, sc, 2026, time.November, 2, 6, 0); !sp.End.Equal(want) {
+	if want := at(t, sc, time.November, 2, 6, 0); !sp.End.Equal(want) {
 		t.Errorf("ScheduledSleep end = %v, want %v", sp.End, want)
 	}
 }
 
 func TestScheduledSleepDisabledWindow(t *testing.T) {
 	sc := mustDisabled(t)
-	now := at(t, sc, 2026, time.June, 15, 15, 0)
+	now := at(t, sc, time.June, 15, 15, 0)
 	sp := sc.ScheduledSleep(now, DayTime{20, 0})
-	wantStart := at(t, sc, 2026, time.June, 15, 20, 0)
+	wantStart := at(t, sc, time.June, 15, 20, 0)
 	if !sp.Start.Equal(wantStart) || !sp.End.Equal(wantStart.Add(8*time.Hour)) {
 		t.Fatalf("ScheduledSleep (disabled) = %+v, want [%v,+8h)", sp, wantStart)
 	}
@@ -417,20 +422,20 @@ func TestScheduledSleepDisabledWindow(t *testing.T) {
 // wall-clock times regardless.
 func TestDSTSpringForward(t *testing.T) {
 	sc := mustSchedule(t)
-	start := sc.on(at(t, sc, 2026, time.March, 29, 12, 0), sc.Start)
+	start := sc.on(at(t, sc, time.March, 29, 12, 0), sc.Start)
 	_, offset := start.Zone()
 	if offset != 2*3600 {
 		t.Errorf("spring-forward start offset = %d, want +7200", offset)
 	}
-	if !sc.WithinWorkingHours(at(t, sc, 2026, time.March, 29, 7, 0)) {
+	if !sc.WithinWorkingHours(at(t, sc, time.March, 29, 7, 0)) {
 		t.Error("07:00 on DST day should be within working hours")
 	}
 }
 
 func TestDSTFallBack(t *testing.T) {
 	sc := mustSchedule(t)
-	before := sc.on(at(t, sc, 2026, time.October, 24, 12, 0), sc.Start)
-	after := sc.on(at(t, sc, 2026, time.October, 26, 12, 0), sc.Start)
+	before := sc.on(at(t, sc, time.October, 24, 12, 0), sc.Start)
+	after := sc.on(at(t, sc, time.October, 26, 12, 0), sc.Start)
 	_, offBefore := before.Zone()
 	_, offAfter := after.Zone()
 	if offBefore != 2*3600 {
@@ -444,8 +449,8 @@ func TestDSTFallBack(t *testing.T) {
 func TestNextWorkingHoursStart(t *testing.T) {
 	sc := mustSchedule(t)
 	// Midday inside the window: the next start is tomorrow morning.
-	now := at(t, sc, 2026, time.June, 15, 12, 0)
-	if start, ok := sc.NextWorkingHoursStart(now); !ok || !start.Equal(at(t, sc, 2026, time.June, 16, 6, 0)) {
+	now := at(t, sc, time.June, 15, 12, 0)
+	if start, ok := sc.NextWorkingHoursStart(now); !ok || !start.Equal(at(t, sc, time.June, 16, 6, 0)) {
 		t.Errorf("NextWorkingHoursStart = %v ok=%v, want 2026-06-16 06:00", start, ok)
 	}
 	// Weekday-only window: from Friday evening the next start is Monday.
@@ -454,8 +459,8 @@ func TestNextWorkingHoursStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fri := at(t, wk, 2026, time.June, 19, 23, 30)
-	if start, ok := wk.NextWorkingHoursStart(fri); !ok || !start.Equal(at(t, wk, 2026, time.June, 22, 6, 0)) {
+	fri := at(t, wk, time.June, 19, 23, 30)
+	if start, ok := wk.NextWorkingHoursStart(fri); !ok || !start.Equal(at(t, wk, time.June, 22, 6, 0)) {
 		t.Errorf("NextWorkingHoursStart(Fri) = %v ok=%v, want Mon 2026-06-22 06:00", start, ok)
 	}
 	// Single-day window, asked after that day's start: the next start is exactly
@@ -464,8 +469,8 @@ func TestNextWorkingHoursStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	monNoon := at(t, mon, 2026, time.June, 15, 12, 0)
-	nextMon := at(t, mon, 2026, time.June, 22, 6, 0)
+	monNoon := at(t, mon, time.June, 15, 12, 0)
+	nextMon := at(t, mon, time.June, 22, 6, 0)
 	if start, ok := mon.NextWorkingHoursStart(monNoon); !ok || !start.Equal(nextMon) {
 		t.Errorf("NextWorkingHoursStart(Mon-only, Mon noon) = %v ok=%v, want %v", start, ok, nextMon)
 	}
