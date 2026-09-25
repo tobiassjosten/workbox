@@ -76,6 +76,12 @@ idempotent:
 | `REPAIRING`        | under repair                  | report      | report       |
 | unrecognized (`UNKNOWN`) | non-transitional, non-stable | report | report |
 
+Resume and start both need Compute Engine to place the machine shape in the zone
+at that moment — a suspended VM reserves no capacity, and neither does a terminated
+one — so either can fail with `compute.ErrNoCapacity`, which the CLI retries for
+a bounded window before reporting the cause and the options (see
+[operations.md](operations.md#zone-has-no-capacity-for-the-machine-type)).
+
 There is **no `STOPPED`** state in GCP — a stopped instance is `TERMINATED`. The
 code models these explicitly in `internal/compute/state.go` rather than passing
 raw strings around. Any status that is neither transitional nor stable —

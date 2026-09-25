@@ -29,10 +29,6 @@ const (
 // reconciler (infra/reconcile.yaml.tftpl).
 const LastActiveQueryPath = lastActiveNamespace + "/" + lastActiveKey
 
-// maxRenderedValue bounds how much of an untrusted guest-attribute value is
-// quoted into an error.
-const maxRenderedValue = 200
-
 // ErrInvalidActivity marks a last-active value that is not a usable unix
 // timestamp — non-numeric, zero or negative, so written by something other than
 // the emitter. Callers treat such a value as unknown; it never counts as recent
@@ -138,9 +134,9 @@ func (g *GCP) Start(ctx context.Context) error {
 		Instance: g.instance,
 	})
 	if err != nil {
-		return fmt.Errorf("starting instance: %w", err)
+		return classifyCallErr(err, "starting")
 	}
-	return waitOp(ctx, op)
+	return waitWakeOp(ctx, op)
 }
 
 // Resume resumes a SUSPENDED instance.
@@ -152,12 +148,13 @@ func (g *GCP) Resume(ctx context.Context) error {
 		Instance: g.instance,
 	})
 	if err != nil {
-		return fmt.Errorf("resuming instance: %w", err)
+		return classifyCallErr(err, "resuming")
 	}
-	return waitOp(ctx, op)
+	return waitWakeOp(ctx, op)
 }
 
-// Suspend suspends a RUNNING instance.
+// Suspend suspends a RUNNING instance. It never classifies capacity: suspending
+// releases capacity rather than asking for it.
 func (g *GCP) Suspend(ctx context.Context) error {
 	defer g.invalidate()
 	op, err := g.client.Suspend(ctx, &computepb.SuspendInstanceRequest{
@@ -238,12 +235,9 @@ func lastActiveFromResp(resp *computepb.GuestAttributes) (time.Time, bool, error
 	// 1970.
 	if err != nil || secs <= 0 {
 		// The VM writes this value, so bound what we render (as probeErr does
-		// for ssh stderr) before it reaches a terminal or --json.
-		shown := raw
-		if r := []rune(shown); len(r) > maxRenderedValue {
-			shown = string(r[:maxRenderedValue]) + "…"
-		}
-		return time.Time{}, false, fmt.Errorf("guest attribute %s=%q: %w", LastActiveQueryPath, shown, ErrInvalidActivity)
+		// for ssh stderr) before it reaches a terminal or --json. %q escapes
+		// whatever control characters survive the bound.
+		return time.Time{}, false, fmt.Errorf("guest attribute %s=%q: %w", LastActiveQueryPath, truncate(raw), ErrInvalidActivity)
 	}
 	return time.Unix(secs, 0), true, nil
 }
@@ -265,16 +259,54 @@ func IsPermissionDenied(err error) bool {
 // ptr returns a pointer to s, for optional proto string fields.
 func ptr(s string) *string { return &s }
 
-// waiter is the subset of *gcompute.Operation used here.
-type waiter interface {
-	Wait(ctx context.Context, opts ...gax.CallOption) error
+// classifyCallErr shapes an error the API call itself returned: a capacity
+// shortage becomes the typed error callers retry on, anything else keeps the
+// operation's own wording. verb names what was attempted ("starting", "resuming").
+func classifyCallErr(err error, verb string) error {
+	if c := capacityErrorFromErr(err); c != nil {
+		return c
+	}
+	return fmt.Errorf("%s instance: %w", verb, err)
 }
 
+// waiter is the subset of *gcompute.Operation used here. Proto is part of it
+// because a failed operation carries its structured error only there: the
+// client polls the operation, assigns the response, and only then synthesizes
+// the googleapi error it returns, so whenever the operation itself failed the
+// details are in Proto(). Wait also reports its own polling and context
+// errors, where the proto carries no error at all — hence waitWakeOp's fallbacks.
+type waiter interface {
+	Wait(ctx context.Context, opts ...gax.CallOption) error
+	Proto() *computepb.Operation
+}
+
+// waitOp waits for an operation and wraps whatever it failed with. Only the two
+// wake paths classify capacity (waitWakeOp): a suspend releases capacity rather
+// than asking for it, so a CapacityError there would report "no capacity for
+// <shape>" about an operation that never needed any.
 func waitOp(ctx context.Context, op waiter) error {
 	if err := op.Wait(ctx); err != nil {
 		return fmt.Errorf("waiting for compute operation: %w", err)
 	}
 	return nil
+}
+
+// waitWakeOp is waitOp for Start and Resume, the two paths a zone can refuse for
+// want of capacity. That is a transient, actionable failure rather than a broken
+// operation, so it is classified — from the operation proto first, which is where
+// the structured details live — and callers retry on it.
+func waitWakeOp(ctx context.Context, op waiter) error {
+	err := op.Wait(ctx)
+	if err == nil {
+		return nil
+	}
+	if c := capacityErrorFromOp(op.Proto(), err); c != nil {
+		return c
+	}
+	if c := capacityErrorFromErr(err); c != nil {
+		return c
+	}
+	return fmt.Errorf("waiting for compute operation: %w", err)
 }
 
 var (

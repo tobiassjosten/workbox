@@ -140,3 +140,17 @@ func TestContextCancellationDuringWait(t *testing.T) {
 		t.Errorf("err = %v, want context.Canceled", err)
 	}
 }
+
+// ErrSeq scripts one result per operation and takes precedence over Err, so a
+// test can drive a few failures and then fall back to a standing error.
+func TestFakeErrSeqTakesPrecedence(t *testing.T) {
+	standing := errors.New("standing")
+	f := &Fake{Current: Suspended, Err: standing, ErrSeq: []error{nil}}
+
+	if err := f.Resume(context.Background()); err != nil {
+		t.Fatalf("first Resume = %v, want nil from ErrSeq", err)
+	}
+	if err := f.Resume(context.Background()); !errors.Is(err, standing) {
+		t.Errorf("second Resume = %v, want the standing Err once ErrSeq is spent", err)
+	}
+}

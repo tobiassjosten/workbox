@@ -20,10 +20,14 @@ type Fake struct {
 	StatusSeq []State
 
 	Calls []string
-	// Err, when non-nil, is returned by Start/Resume/Suspend. Status succeeds
-	// unless StatusErr is set, so tests can drive a failing transition from a
-	// known state.
+	// Err, when non-nil, is returned by Start/Resume/Suspend once ErrSeq is
+	// exhausted. Status succeeds unless StatusErr is set, so tests can drive a
+	// failing transition from a known state.
 	Err error
+	// ErrSeq, when non-empty, is consumed one entry per Start/Resume/Suspend
+	// call and takes precedence over Err, so tests can drive an operation that
+	// fails a few times and then succeeds. A nil entry means success.
+	ErrSeq []error
 	// StatusErr, when non-nil, is returned by Status.
 	StatusErr error
 }
@@ -55,8 +59,16 @@ func (f *Fake) op(name string, result State) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.Calls = append(f.Calls, name)
-	if f.Err != nil {
-		return f.Err
+	err := f.Err
+	if len(f.ErrSeq) > 0 {
+		err = f.ErrSeq[0]
+		f.ErrSeq = f.ErrSeq[1:]
+	}
+	// A failed operation leaves the fake's state alone. The real instance may
+	// land elsewhere — a capacity-failed resume can leave it TERMINATED — which
+	// tests model by scripting StatusSeq alongside ErrSeq.
+	if err != nil {
+		return err
 	}
 	f.Current = result
 	return nil

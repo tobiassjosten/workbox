@@ -15,11 +15,16 @@ import (
 type Compute interface {
 	// Status returns the current normalized instance state.
 	Status(ctx context.Context) (State, error)
-	// Start boots a TERMINATED instance and waits for the operation.
+	// Start boots a TERMINATED instance and waits for the operation. It may fail
+	// with ErrNoCapacity (a *CapacityError) when the zone cannot place the
+	// instance's machine type; that is transient, and callers may retry.
 	Start(ctx context.Context) error
-	// Resume resumes a SUSPENDED instance and waits for the operation.
+	// Resume resumes a SUSPENDED instance and waits for the operation. As with
+	// Start, it may fail with ErrNoCapacity.
 	Resume(ctx context.Context) error
-	// Suspend suspends a RUNNING instance and waits for the operation.
+	// Suspend suspends a RUNNING instance and waits for the operation. It cannot
+	// fail with ErrNoCapacity: suspending releases capacity rather than asking
+	// for it.
 	Suspend(ctx context.Context) error
 }
 
@@ -56,7 +61,9 @@ func WaitStable(ctx context.Context, c Compute) error {
 
 // Wake brings the instance to RUNNING, choosing resume vs start by state, and
 // is idempotent when the instance is already running. Transitional states are
-// waited out before acting.
+// waited out before acting. Either path may fail with ErrNoCapacity (a
+// *CapacityError) when the zone cannot place the instance's machine type; that
+// is transient, and callers may retry.
 func Wake(ctx context.Context, c Compute) error {
 	for {
 		s, err := c.Status(ctx)

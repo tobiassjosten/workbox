@@ -1,6 +1,7 @@
 package compute
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -10,6 +11,8 @@ import (
 	"time"
 
 	computepb "cloud.google.com/go/compute/apiv1/computepb"
+	"github.com/googleapis/gax-go/v2"
+	"github.com/googleapis/gax-go/v2/apierror"
 	"google.golang.org/api/googleapi"
 )
 
@@ -229,5 +232,137 @@ func TestParseLastStart(t *testing.T) {
 	}
 	if _, _, err := parseLastStart("yesterday"); err == nil {
 		t.Error("malformed: want an error")
+	}
+}
+
+// fakeOp is a stand-in for *gcompute.Operation: Wait reports the scripted
+// failure and Proto returns the operation the client would have polled.
+type fakeOp struct {
+	err   error
+	proto *computepb.Operation
+}
+
+func (o fakeOp) Wait(_ context.Context, _ ...gax.CallOption) error { return o.err }
+func (o fakeOp) Proto() *computepb.Operation                       { return o.proto }
+
+// Suspending releases capacity rather than asking for it, so the plain wait must
+// not classify: a CapacityError there would report "no capacity for <shape>"
+// about an operation that never needed any. Suspend is its only caller.
+func TestWaitOpDoesNotClassifyCapacity(t *testing.T) {
+	apiErr, ok := apierror.FromError(&googleapi.Error{
+		Code:    http.StatusServiceUnavailable,
+		Message: `SERVICE UNAVAILABLE: errors:{code:"ZONE_RESOURCE_POOL_EXHAUSTED"}`,
+	})
+	if !ok {
+		t.Fatal("apierror.FromError did not wrap the googleapi error")
+	}
+	op := fakeOp{err: apiErr, proto: capacityOp(codePoolExhausted, "europe-north2-a", "e2-custom-4-8192", "")}
+
+	err := waitOp(context.Background(), op)
+	if err == nil {
+		t.Fatal("waitOp = nil, want an error")
+	}
+	if errors.Is(err, ErrNoCapacity) {
+		t.Errorf("waitOp classified a capacity failure (%v); only the wake paths may", err)
+	}
+	if want := "waiting for compute operation: "; !strings.HasPrefix(err.Error(), want) {
+		t.Errorf("waitOp = %q, want the plain operation wording %q", err.Error(), want)
+	}
+}
+
+// A failed operation carries its capacity details only in the proto, so the wake
+// wait must classify from there and fall back to the message when it cannot.
+func TestWaitWakeOp(t *testing.T) {
+	// The real client returns an *apierror.APIError wrapping the googleapi
+	// error it synthesizes from the operation, so classification has to reach
+	// through that wrapper (see cloud.google.com/go/compute apiv1/operations.go).
+	apiErr, ok := apierror.FromError(&googleapi.Error{
+		Code:    http.StatusServiceUnavailable,
+		Message: `SERVICE UNAVAILABLE: errors:{code:"ZONE_RESOURCE_POOL_EXHAUSTED"}`,
+	})
+	if !ok {
+		t.Fatal("apierror.FromError did not wrap the googleapi error")
+	}
+
+	tests := []struct {
+		name        string
+		op          fakeOp
+		wantErr     bool
+		wantNoCap   bool
+		wantZone    string
+		wantMessage string
+	}{
+		{
+			name: "success",
+			op:   fakeOp{proto: &computepb.Operation{}},
+		},
+		{
+			name:      "capacity failure is classified from the proto",
+			op:        fakeOp{err: apiErr, proto: capacityOp(codePoolExhausted, "europe-north2-a", "e2-custom-4-8192", "")},
+			wantErr:   true,
+			wantNoCap: true,
+			wantZone:  "europe-north2-a",
+		},
+		{
+			name:      "capacity failure without a proto falls back to the message",
+			op:        fakeOp{err: apiErr},
+			wantErr:   true,
+			wantNoCap: true,
+		},
+		{
+			name:        "any other failure keeps the operation wording",
+			op:          fakeOp{err: errors.New("boom"), proto: &computepb.Operation{}},
+			wantErr:     true,
+			wantMessage: "waiting for compute operation: boom",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := waitWakeOp(context.Background(), tc.op)
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("waitWakeOp = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("waitWakeOp = nil, want an error")
+			}
+			if got := errors.Is(err, ErrNoCapacity); got != tc.wantNoCap {
+				t.Errorf("errors.Is(err, ErrNoCapacity) = %v, want %v (err: %v)", got, tc.wantNoCap, err)
+			}
+			if tc.wantZone != "" {
+				var capErr *CapacityError
+				if !errors.As(err, &capErr) {
+					t.Fatalf("waitWakeOp = %v, want a *CapacityError", err)
+				}
+				if capErr.Zone != tc.wantZone {
+					t.Errorf("zone = %q, want %q", capErr.Zone, tc.wantZone)
+				}
+			}
+			if tc.wantMessage != "" && err.Error() != tc.wantMessage {
+				t.Errorf("waitWakeOp = %q, want %q", err.Error(), tc.wantMessage)
+			}
+		})
+	}
+}
+
+// An error from the API call itself (rather than from the operation it started)
+// is classified the same way, with the verb preserved in the fallback wording.
+func TestClassifyCallErr(t *testing.T) {
+	capacity := &googleapi.Error{
+		Code:    http.StatusServiceUnavailable,
+		Message: `SERVICE UNAVAILABLE: errors:{code:"ZONE_RESOURCE_POOL_EXHAUSTED"}`,
+	}
+	if err := classifyCallErr(capacity, "resuming"); !errors.Is(err, ErrNoCapacity) {
+		t.Errorf("classifyCallErr(capacity) = %v, want a capacity error", err)
+	}
+	err := classifyCallErr(errors.New("boom"), "starting")
+	if errors.Is(err, ErrNoCapacity) {
+		t.Error("a plain failure must not be classified as capacity")
+	}
+	if want := "starting instance: boom"; err.Error() != want {
+		t.Errorf("classifyCallErr = %q, want %q", err.Error(), want)
 	}
 }
