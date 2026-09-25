@@ -51,6 +51,20 @@ in the future or one that is not a number, so each forged value expires like a
 real one. The impact is cost only — no privilege is gained, and a scheduled sleep
 still wins — and idle shutdown is a cost control, not a security boundary.
 
+**Text workbox did not author is bounded and stripped before it is printed.**
+Two sources reach the terminal: the VM's `workbox/last_active` guest attribute,
+which any process on the VM can write, and the Compute API's capacity error
+details (zone, machine type, the alternative zones, Google's own message). Both are
+cut to a rune bound in `internal/compute` — the list of alternative zones to a
+length bound as well — and neither reaches a terminal raw: the guest attribute is
+rendered with `%q`, which escapes anything non-printable, and the capacity text is
+normalized, dropping control and format runes (the ESC that would start an escape
+sequence and the bidi overrides that would reorder a line among them) and
+collapsing whitespace to single spaces, so the single-line error stays one line.
+Either way the text is passed as a formatting *argument*, never as a format string.
+A terminal cannot be repainted, nor a message forged, by whatever is on the other
+end.
+
 The signal is a socket check, not a session check: the emitter counts any
 established inbound connection on port 22, and a socket reaches that state
 before SSH authentication. Anyone the tailnet policy lets reach `tcp:22` can
