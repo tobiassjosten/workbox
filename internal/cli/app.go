@@ -29,6 +29,14 @@ type App struct {
 	// Now returns the current time; defaults to time.Now.
 	Now func() time.Time
 	Out io.Writer
+	// ErrOut takes failure diagnosis, so advice travels with the error main()
+	// prints rather than down a stream the user may have redirected away.
+	// Defaults to Out, which keeps a test's single buffer intact.
+	ErrOut io.Writer
+	// wait pauses between wake retries; nil uses a real timer. Unexported
+	// because it exists for tests, which drive it with a fake clock. Not named
+	// sleep: that is the command that suspends the VM.
+	wait func(ctx context.Context, d time.Duration) error
 }
 
 func (a *App) now() time.Time {
@@ -40,6 +48,46 @@ func (a *App) now() time.Time {
 
 func (a *App) printf(format string, args ...any) {
 	fmt.Fprintf(a.Out, format, args...)
+}
+
+// errPrintf writes failure diagnosis to ErrOut.
+func (a *App) errPrintf(format string, args ...any) {
+	out := a.ErrOut
+	if out == nil {
+		out = a.Out
+	}
+	fmt.Fprintf(out, format, args...)
+}
+
+// graceWindow is how long a freshly woken VM is held awake: long enough to
+// outlast the boot and the wait for SSH before idle shutdown can apply. Zero when
+// idle shutdown is disabled, since the grace only guards against that.
+func (a *App) graceWindow() time.Duration {
+	idle := a.Cfg.Schedule.IdleTimeout()
+	if idle <= 0 {
+		return 0
+	}
+	return idle + a.Cfg.SSH.WaitTimeout()
+}
+
+// idleDisabledNote qualifies a hold report when nothing else would suspend the
+// VM anyway: idle shutdown off, and no scheduled sleep to outrank the hold. A
+// surviving sleep is reported separately.
+func (a *App) idleDisabledNote(sleep *schedule.Span) string {
+	if a.Cfg.Schedule.IdleTimeout() <= 0 && sleep == nil {
+		return " (idle shutdown is disabled, so nothing would auto-suspend anyway)"
+	}
+	return ""
+}
+
+// saveOrClear writes doc, deleting it instead when no spans are left: the
+// reconciler only garbage-collects documents that still hold one, so an empty
+// document would linger forever.
+func (a *App) saveOrClear(ctx context.Context, doc *state.Document) error {
+	if doc.Empty() {
+		return a.Store.Clear(ctx)
+	}
+	return a.Store.Save(ctx, doc)
 }
 
 // activeDoc loads the state document with expired spans pruned as of now.
@@ -57,7 +105,12 @@ func (a *App) activeDoc(ctx context.Context, now time.Time) (*state.Document, er
 // is disabled, since the grace only guards against idle shutdown (a scheduled
 // sleep wins over a hold regardless). A scheduled sleep that is currently in
 // effect is cancelled — a future one is left in place — so the reconciler does
-// not immediately re-suspend the VM.
+// not immediately re-suspend the VM. The wake is retried for a bounded window when
+// the zone cannot place the machine type (see wakeWithRetry), so this can block
+// for some minutes; a wake that waited re-measures the grace from the post-wake
+// clock, so the wait is not taken out of it, and re-applies the in-effect test — a
+// sleep that began while we waited is cancelled too, since it would otherwise
+// suspend the VM this call just reported awake.
 func (a *App) Wake(ctx context.Context) error {
 	now := a.now()
 	doc, err := a.activeDoc(ctx, now)
@@ -74,10 +127,11 @@ func (a *App) Wake(ctx context.Context) error {
 		changed = true
 	}
 	var graceMsg string
-	if idle := a.Cfg.Schedule.IdleTimeout(); idle > 0 {
-		// The grace starts before the resume and must outlast the boot and the
-		// wait for SSH, or a short idle timeout could suspend a VM still booting.
-		grace := a.Sched.KeepAwakeHold(now, idle+a.Cfg.SSH.WaitTimeout())
+	var top *holdTopUp
+	if window := a.graceWindow(); window > 0 {
+		// Written before the resume, so a VM that comes up is protected from the
+		// first reconciler tick onwards.
+		grace := a.Sched.KeepAwakeHold(now, window)
 		hold, kept := longerAwakeHold(doc, grace)
 		note := "" // a preserved hold is the user's own, not a grace window
 		if !kept {
@@ -86,18 +140,16 @@ func (a *App) Wake(ctx context.Context) error {
 			note = " (grace window)"
 		}
 		graceMsg = holdMessage(a.fmtTime(hold.End), kept, note)
+		// The same window, re-measured after a capacity wait: settleAfterWait
+		// never shortens a hold, so a preserved one is only touched when the
+		// fresh grace would outlast it — and what it writes is then the grace
+		// window, whatever hold it replaced, so it is always labelled as one.
+		top = &holdTopUp{d: window, grace: true}
 	}
 	// Persist before the compute call so a failed resume still leaves the grace in
-	// place (and the cancelled sleep gone) for the next reconciler tick. A document
-	// with no spans left is deleted instead: the reconciler only garbage-collects
-	// documents that still hold one.
+	// place (and the cancelled sleep gone) for the next reconciler tick.
 	if changed {
-		if doc.Empty() {
-			err = a.Store.Clear(ctx)
-		} else {
-			err = a.Store.Save(ctx, doc)
-		}
-		if err != nil {
+		if err := a.saveOrClear(ctx, doc); err != nil {
 			return err
 		}
 	}
@@ -106,7 +158,9 @@ func (a *App) Wake(ctx context.Context) error {
 		a.printf("%s", graceMsg)
 	}
 	a.printPendingSleep(doc.Sleep)
-	if err := compute.Wake(ctx, a.Compute); err != nil {
+	// The hold above was measured before the resume, so wakeWithRetry keeps it
+	// alive while it waits and reports the end the user should count on.
+	if err := a.wakeWithRetry(ctx, top); err != nil {
 		return err
 	}
 	a.printf("workbox is awake.\n")
@@ -179,7 +233,10 @@ func (a *App) SleepAt(ctx context.Context, hhmm string) error {
 // KeepAwake establishes a hold keeping the VM awake for at least d, waking it now
 // if necessary. A scheduled sleep the *requested* hold overlaps is cancelled; a
 // later one — or one covered only by a longer pre-existing hold — is left in
-// place.
+// place. As in Wake, the wake is retried for a bounded window when the zone has no
+// capacity, and a wake that waited re-measures the hold from the post-wake clock
+// so d is counted from when the VM is actually awake; a sleep that came into effect
+// during that wait is cancelled as well, whichever hold is on record.
 func (a *App) KeepAwake(ctx context.Context, d time.Duration) error {
 	if d <= 0 {
 		return errors.New("duration must be positive")
@@ -202,16 +259,14 @@ func (a *App) KeepAwake(ctx context.Context, d time.Duration) error {
 		return err
 	}
 	a.printCancelledSleep(cancelled)
-	// Only claim the hold is redundant when nothing else would suspend: a
-	// surviving scheduled sleep outranks it, and is reported below.
-	note := ""
-	if a.Cfg.Schedule.IdleTimeout() <= 0 && doc.Sleep == nil {
-		note = " (idle shutdown is disabled, so nothing would auto-suspend anyway)"
-	}
-	a.printHold(hold, kept, note)
+	a.printHold(hold, kept, a.idleDisabledNote(doc.Sleep))
 	// A surviving scheduled sleep still wins over the hold where they overlap.
 	a.printPendingSleep(doc.Sleep)
-	if err := compute.Wake(ctx, a.Compute); err != nil {
+	// `keep-awake 3h` promises three hours of awake VM, so a capacity wait must
+	// not be taken out of the hold reported above — a short one could otherwise
+	// expire before the VM is even up. The re-measured hold cancels a scheduled
+	// sleep it now reaches over, exactly as the requested one did.
+	if err := a.wakeWithRetry(ctx, &holdTopUp{d: d}); err != nil {
 		return err
 	}
 	a.printf("workbox is awake.\n")

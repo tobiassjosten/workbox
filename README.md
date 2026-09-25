@@ -390,12 +390,23 @@ workbox sleep 01:30        # schedule a one-off suspend at 01:30 (handles past-m
 workbox cancel             # clear a scheduled sleep and the keep-awake hold
 ```
 
-`workbox wake` sets a keep-awake grace (the idle timeout plus the SSH wait timeout)
-so a freshly woken VM is not suspended while it resumes or before the on-VM
-activity emitter first reports. With idle shutdown disabled no grace is set: it
-only guards against idle shutdown, and a scheduled sleep wins over a hold
-regardless. A VM started any other way (first provisioning, a Terraform
-replacement, the Console) is covered by the boot grace above.
+A wake can fail because the zone has no capacity for your machine type right
+then — waking needs Compute Engine to place that machine shape in the zone at
+that moment, and neither a suspended nor a terminated VM reserves capacity. Every
+command that wakes retries for about 5 minutes before giving up with the cause
+and the options (so `doctor --wake` can take that long too). The progress and the
+cause go to stderr, so they stay visible when you redirect stdout; see
+[docs/operations.md](docs/operations.md#zone-has-no-capacity-for-the-machine-type).
+
+`workbox wake` sets a keep-awake grace (the idle timeout plus the SSH wait
+timeout) so a freshly woken VM is not suspended while it resumes or before the
+on-VM activity emitter first reports. A wake that had to wait for capacity keeps
+that hold alive while it waits and re-measures it once the VM is up, so the wait
+is not taken out of it; `workbox keep-awake` does the same with the duration you
+asked for. With idle shutdown disabled no grace is set: it only guards against
+idle shutdown, and a scheduled sleep wins over a hold regardless. A VM started
+any other way (first provisioning, a Terraform replacement, the Console) is
+covered by the boot grace above.
 
 Inspect current state:
 
@@ -514,6 +525,10 @@ Then verify:
 - The SSH host resolves via MagicDNS
 - The operator role has been granted to your identity
 - `herdr` and `claude` are present on the VM
+- The zone had capacity for your machine type: a wake that failed with `no
+  capacity for <machine type>` is a zone shortage, not a broken setup — see
+  [docs/operations.md](docs/operations.md#zone-has-no-capacity-for-the-machine-type)
+  for the options
 - After upgrading or changing provisioning, the VM was rebooted or cold-restarted
   once so the startup-script (including the activity emitter) ran — see
   [docs/operations.md](docs/operations.md#applying-provisioning-changes); when
@@ -532,6 +547,6 @@ Then verify:
 
 - [docs/architecture.md](docs/architecture.md) — the two planes in detail
 - [docs/operations.md](docs/operations.md) — auto-suspend and holds, applying
-  provisioning changes, upgrade steps, VM rebuild, disk detach/reattach, snapshot
-  restore
+  provisioning changes, upgrade steps, zone capacity, VM rebuild, disk
+  detach/reattach, snapshot restore
 - [docs/security.md](docs/security.md) — the full security model

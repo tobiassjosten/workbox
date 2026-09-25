@@ -25,12 +25,15 @@ Terraform owns the *baseline desired infrastructure*. The CLI/Workflow own
   holds/scheduled sleep). Pure, clock-injected, heavily tested. **This is the
   core; change it with tests.**
 - `internal/config/` — the single YAML config schema (shared with Terraform).
-- `internal/compute/` — `Compute` interface, GCP client, state model, fake, and
-  the read-only `Activity` interface (last-active guest attribute and last
-  instance start).
+- `internal/compute/` — `Compute` interface, GCP client, state model, fake, the
+  read-only `Activity` interface (last-active guest attribute and last instance
+  start), the typed capacity failure (`ErrNoCapacity` / `CapacityError`) a wake
+  retries on, and the bounds every untrusted value passes through before it is
+  printed (`text.go`).
 - `internal/state/` — Firestore-backed `Store`, the wire schema shared with the
   Workflow (`infra/reconcile.yaml.tftpl`), and a fake.
-- `internal/cli/` — testable command logic (status/wake/sleep/keep-awake/cancel).
+- `internal/cli/` — testable command logic (status/wake/sleep/keep-awake/cancel)
+  and the bounded capacity-retry wake (`capacity.go`).
 - `internal/ssh/`, `internal/herdr/` — process handoff (no Go SSH stack).
 - `internal/doctor/` — read-only diagnostics.
 - `infra/` — Terraform: APIs, VPC, VM, disks/snapshots, IAM, Firestore, Workflow,
@@ -54,7 +57,10 @@ working hours > idle shutdown** (see `schedule.AutoSuspend`).
 - **Scheduled sleep** (`workbox sleep HH:MM`) and **keep-awake hold** are
   absolute-time spans in Firestore; `wake` sets a keep-awake grace (when idle
   shutdown is on) so a resumed VM isn't suspended before the emitter first
-  reports.
+  reports. When the zone has no capacity, the wake retries for a bounded window,
+  keeping that hold alive while it waits, re-measuring it once the VM is up, and
+  cancelling a scheduled sleep that came into effect meanwhile
+  (`internal/cli/capacity.go`).
 
 Two contracts with the reconciler, each change-both-together:
 - Firestore span layout: `internal/state/firestore.go` ↔

@@ -68,6 +68,13 @@ workbox schedule         # working hours, idle setting, hold and scheduled sleep
   shutdown, and a scheduled sleep wins over a hold regardless.
   The startup script also reports activity when it starts, once a minute for up
   to an hour while it runs, and when it finishes.
+  A wake that had to wait for zone capacity keeps the hold alive while it waits
+  and re-measures it once the VM is up, so the wait is not taken out of it;
+  `workbox keep-awake` does the same with the duration you asked for. A wake that
+  waited also re-checks the scheduled sleep afterwards, since one in effect would
+  otherwise suspend the VM you were just told was awake — see the
+  `workbox sleep HH:MM` bullet below, and [Zone has no capacity for the machine
+  type](#zone-has-no-capacity-for-the-machine-type).
 - `workbox sleep 20:00` schedules a one-off suspend at the next 20:00; it fires
   **even within working hours**. Run `workbox cancel` before then to call it off
   (this also clears any keep-awake hold), or just `workbox wake` afterwards — a
@@ -77,7 +84,10 @@ workbox schedule         # working hours, idle setting, hold and scheduled sleep
   — or after 8 h when working hours are absent or disabled.
 - `workbox sleep HH:MM` leaves a keep-awake hold in place; where the two overlap,
   the scheduled sleep wins (see precedence below). `workbox keep-awake` cancels
-  a scheduled sleep only when the new hold runs past its start.
+  a scheduled sleep only when the new hold runs past its start — and after a
+  capacity wait it re-applies that rule to the hold re-measured from the
+  post-wake clock, so a sleep that hold now runs past is cancelled too, as is
+  one that came into effect while it waited.
 - `workbox keep-awake` also **resumes a suspended VM**, so arming a hold for a
   later session starts the machine (and its billing) now.
 
@@ -144,6 +154,73 @@ Herdr/Claude integration hook, that the activity emitter's timer is active and
 its last run succeeded, and that a last-active value is actually readable. By
 default it never wakes a sleeping VM; pass `--wake` to first wake the VM so the
 remote checks can run. Failures print a remediation hint.
+
+### Zone has no capacity for the machine type
+
+```
+workbox: europe-north2-a has no capacity for e2-custom-8-16384 right now (ZONE_RESOURCE_POOL_EXHAUSTED)
+```
+
+Waking needs Compute Engine to place that exact machine shape in that zone at
+that moment: a suspended VM reserves no capacity, and neither does a terminated
+one, so both a resume and a cold start can fail even though nothing about your
+setup changed. It is a transient shortage, most common in small regions, and
+every command that wakes (`workbox`, `wake`, `ssh`, `herdr`, `forward`,
+`keep-awake`, `doctor --wake`) already retries for about 5 minutes before
+giving up. A failed wake leaves your data alone: the disks and, unless the VM has
+since been terminated, the suspended memory state are intact.
+
+Its Firestore state changes do stand, though. The hold it wrote before resuming
+— `wake`'s grace, or the duration `keep-awake` was given — was refreshed while
+the wake waited, unless the hold already ran well past the retry window, so it
+can end somewhat later than the end the command printed. A scheduled sleep the
+wake cancelled before waiting stays cancelled: for `wake` that is one already in
+effect, for `keep-awake` any the requested hold reaches over. `workbox schedule`
+shows where both stand. (The post-wait re-checks under [Grace, holds and one-off
+sleep](#grace-holds-and-one-off-sleep) apply only to a wake that succeeded.)
+
+Workbox writes that document whole rather than field by field, and the post-wait
+top-up re-reads it first, so only a schedule change from another shell — `sleep`,
+`cancel`, or any of the wake commands listed above — that lands between that read
+and the write is lost: a brief window, one read-modify-write round trip. When the
+hold is short enough that it could lapse mid-wake (a short idle timeout, or a
+short `keep-awake` duration) it is also refreshed between attempts, which adds one
+such moment per attempt. If you changed the schedule from another shell while a
+wake was waiting, `workbox schedule` shows what is on record.
+
+When the retries run out:
+
+- **Try again in a while.** Shortages usually clear in minutes to hours, and
+  retrying costs nothing.
+- **Change the machine shape.** Another series draws on a different capacity
+  pool: set `gcp.machine_type` in your config and run `make tf-apply`. Terraform
+  stops the instance to change its shape (`allow_stopping_for_update`), so the
+  **suspended memory state is discarded** — the disks are untouched. Keep
+  suspend/resume support in mind: no GPUs, no Local SSD, at most 208 GB of
+  memory.
+- **Move to another zone.** Not just a config change, and not covered by the
+  procedures below: a zonal disk only attaches to an instance in its own zone,
+  so the detach/attach in [Restoring from a
+  snapshot](#restoring-from-a-snapshot) and the in-place `-replace` in
+  [Replacing the VM while keeping `/work`](#replacing-the-vm-while-keeping-work)
+  are both same-zone operations. A move means migrating the disk and the
+  instance by hand and reconciling Terraform state — `google_compute_disk.data`
+  carries `prevent_destroy`, and the instance's zone forces replacement, so the
+  suspended memory state is lost either way. There is no documented procedure;
+  changing `gcp.zone` alone fails the apply.
+- **Reservations** guarantee capacity, but you pay for the reserved shape around
+  the clock, which cancels out suspend-on-idle. Rarely worth it for a single
+  development VM.
+
+When the give-up report names other zones (`GCP reports capacity in: ...`),
+those are the zones Compute Engine says can take the shape right now — useful
+input for the zone move, not something workbox acts on.
+
+If `workbox status` reports `TERMINATED` instead of `SUSPENDED` after the failed
+wake, the memory image is already gone and the next wake cold-boots it, as after
+a very long suspension (see [Maximum suspend
+duration](#maximum-suspend-duration)) — that boot needs capacity for the same
+shape, which is why the retry covers it too.
 
 ### Tailscale / SSH not working
 
@@ -253,7 +330,10 @@ lost** (the disks persist). Practical implications:
 
 - After a very long suspension, `workbox wake` will `start` the instance (a fresh
   boot) rather than `resume` it — `wake` handles both paths automatically, so
-  nothing breaks, but in-memory Herdr/Claude sessions are gone.
+  nothing breaks, but in-memory Herdr/Claude sessions are gone. The same is true
+  after a resume that failed for lack of zone capacity and left the instance
+  `TERMINATED` (see [Zone has no capacity for the machine
+  type](#zone-has-no-capacity-for-the-machine-type)).
 - Treat suspend as an overnight/weekend convenience, not durable storage. Push
   work to Git regularly; the data disk and its snapshots are the durable layer.
 

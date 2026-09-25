@@ -187,6 +187,9 @@ func newRootCmd() *cobra.Command {
 	doctorCmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Run diagnostics; use --wake to first wake the VM for remote checks",
+		Long: "Run read-only diagnostics. With --wake the VM is woken first; the wake\n" +
+			"is retried for a few minutes when the zone has no capacity for the\n" +
+			"machine type, so that can take a while.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx, cancel := signalContext()
 			defer cancel()
@@ -264,6 +267,7 @@ func buildApp(ctx context.Context, cfg *config.Config) (*cli.App, func(), error)
 		Store:    store,
 		Activity: comp, // *compute.GCP reads the last-active guest attribute and lastStartTimestamp
 		Out:      os.Stdout,
+		ErrOut:   os.Stderr,
 	}
 	cleanup := func() {
 		// Best-effort release of client connections on shutdown; a close error is
@@ -400,6 +404,17 @@ func runForward(ctx context.Context, cfgPath string, specs []string) error {
 	return ssh.ExecForward(sshTarget(cfg), forwards)
 }
 
+// wakeRemedy is the doctor remedy for a --wake that failed. A capacity shortage
+// already printed its own options, so the remedy points there rather than at the
+// SSH diagnosis the generic wording assumes. Phrased like every other remedy:
+// lower-case, no terminal period.
+func wakeRemedy(err error) string {
+	if errors.Is(err, compute.ErrNoCapacity) {
+		return "see the capacity options above; the checks below ran without the VM"
+	}
+	return "see the diagnosis above; the checks below ran anyway"
+}
+
 // runDoctor runs read-only diagnostics. With wake=true it first wakes the VM and
 // waits for SSH so the remote checks can run; otherwise it never wakes it.
 func runDoctor(ctx context.Context, cfgPath string, wake bool) error {
@@ -431,7 +446,7 @@ func runDoctor(ctx context.Context, cfgPath string, wake bool) error {
 			}
 			wakeResult = []doctor.Result{{
 				Name: "wake", Level: doctor.Fail, Detail: err.Error(),
-				Remedy: "see the diagnosis above; the checks below ran anyway",
+				Remedy: wakeRemedy(err),
 			}}
 		}
 	}

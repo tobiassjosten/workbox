@@ -189,3 +189,29 @@ schedule:
 		t.Fatalf("runForward = %v, want a cannot-bind error", err)
 	}
 }
+
+// The capacity branch is selected through a wrapped error, via errors.Is.
+func TestWakeRemedy(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "capacity",
+			err:  fmt.Errorf("waking: %w", &compute.CapacityError{Code: "ZONE_RESOURCE_POOL_EXHAUSTED"}),
+			want: "see the capacity options above; the checks below ran without the VM",
+		},
+		{
+			name: "anything else",
+			err:  errors.New("ssh not reachable"),
+			want: "see the diagnosis above; the checks below ran anyway",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := wakeRemedy(tc.err); got != tc.want {
+				t.Errorf("wakeRemedy = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
